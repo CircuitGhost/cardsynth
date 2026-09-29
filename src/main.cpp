@@ -44,8 +44,8 @@ enum EditParam : uint8_t {
 };
 
 struct Voice {
-  bool active = false;
-  bool gate = false;
+  volatile bool active = false;
+  volatile bool gate = false;
   float phase = 0.0f;
   float phase2 = 0.0f;
   float incr = 0.0f;
@@ -74,6 +74,8 @@ static volatile int gWriteBuf = 0;
 static volatile bool gAudioRunning = false;
 static TaskHandle_t gAudioTask = nullptr;
 
+static M5Canvas gCanvas(&M5Cardputer.Display);
+
 static uint8_t gRootNote = 0;  // 0=C .. 11=B
 static ScaleType gScale = SCALE_MAJOR;
 static ChordType gChordType = CHORD_TRIAD;
@@ -99,6 +101,18 @@ static const char* kWaveNames[] = { "Saw", "Square", "Tri" };
 static const char* kEditNames[] = {
   "Cutoff", "Reso", "Attack", "Release", "Detune", "Wave", "Volume"
 };
+
+static inline const char* getNoteName(int midi) {
+  int idx = ((midi % 12) + 12) % 12;
+  return kNoteNames[idx];
+}
+
+static inline float softClip(float x) {
+  if (x >= 1.5f) return 1.0f;
+  if (x <= -1.5f) return -1.0f;
+  return x - (x * x * x) * (1.0f / 3.0f);
+}
+
 
 // Scale degree intervals from root (semitones), null-terminated by -1
 static const int8_t kScaleIntervals[SCALE_COUNT][8] = {
@@ -219,7 +233,7 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
       q = (thirdInterval == 3) ? "m9" : "9";
     }
   }
-  snprintf(nameOut, nameLen, "%s%s%s", kNoteNames[rootMidi % 12], q, invert ? " inv" : "");
+  snprintf(nameOut, nameLen, "%s%s%s", getNoteName(rootMidi), q, invert ? " inv" : "");
 }
 
 static int allocVoice() {
@@ -242,6 +256,9 @@ static void noteOn(int midi, float velocity = 1.0f) {
   portENTER_CRITICAL(&gAudioMux);
   const int idx = allocVoice();
   Voice& v = gVoices[idx];
+  for (int i = 0; i < kMaxVoices; i++) {
+    if (gVoices[i].active) gVoices[i].age++;
+  }
   v.active = true;
   v.gate = true;
   v.phase = 0.0f;
@@ -250,10 +267,6 @@ static void noteOn(int midi, float velocity = 1.0f) {
   v.incr2 = (hz * det) / kSampleRate;
   v.env = 0.0f;
   v.velocity = velocity;
-  v.age = 0;
-  for (int i = 0; i < kMaxVoices; i++) {
-    if (gVoices[i].active) gVoices[i].age++;
-  }
   v.age = 0;
   portEXIT_CRITICAL(&gAudioMux);
 }
@@ -283,7 +296,7 @@ static void playChordPad(int padIndex, bool invert) {
   gLastNotes[0] = 0;
   for (int i = 0; i < count; i++) {
     char piece[8];
-    snprintf(piece, sizeof(piece), "%s%s", i ? " " : "", kNoteNames[notes[i] % 12]);
+    snprintf(piece, sizeof(piece), "%s%s", i ? " " : "", getNoteName(notes[i]));
     strncat(gLastNotes, piece, sizeof(gLastNotes) - strlen(gLastNotes) - 1);
   }
   gActivePad = padIndex;
@@ -316,8 +329,9 @@ static void renderBlock(int16_t* out, size_t frames) {
   const float releaseInc = 1.0f / fmaxf(1.0f, gParams.releaseMs * 0.001f * kSampleRate);
   static float lp = 0.0f;
   static float bp = 0.0f;
-  const float f = clampf(gParams.cutoff * gParams.cutoff, 0.01f, 0.95f);
-  const float q = clampf(gParams.reso * 0.9f, 0.0f, 0.9f);
+  // Stable 2x-stepped Chamberlin coefficients
+  const float f = clampf(gParams.cutoff * 0.45f, 0.005f, 0.45f);
+  const float q = clampf(gParams.reso * 0.85f, 0.0f, 0.85f);
   const float master = gParams.volume * 0.45f;
   const Waveform wave = gParams.wave;
 
@@ -349,12 +363,14 @@ static void renderBlock(int16_t* out, size_t frames) {
       if (v.phase2 >= 1.0f) v.phase2 -= 1.0f;
     }
 
-    // Lowpass (lp). Bandpass was nearly inaudible on the tiny speaker.
-    lp += f * (mix - lp - q * bp);
-    bp += f * (lp - bp);
-    float sample = lp * master;
-    if (sample > 1.0f) sample = 1.0f;
-    if (sample < -1.0f) sample = -1.0f;
+    // 2x oversampled Chamberlin lowpass for rock-solid stability
+    for (int step = 0; step < 2; step++) {
+      lp += f * (mix - lp - q * bp);
+      bp += f * (lp - bp);
+    }
+
+    // Soft saturation for warm analog-style headroom
+    float sample = softClip(lp * master);
     out[n] = (int16_t)(sample * 28000.0f);
   }
 }
@@ -381,7 +397,7 @@ static void audioTask(void*) {
 }
 
 static void drawUi() {
-  auto& d = M5Cardputer.Display;
+  auto& d = gCanvas;
   d.fillScreen(TFT_BLACK);
   d.setTextDatum(top_left);
 
@@ -398,8 +414,8 @@ static void drawUi() {
   d.drawString(gLastNotes, 4, 42);
 
   char line[48];
-  snprintf(line, sizeof(line), "%s %s | %s | oct%d",
-           kNoteNames[gRootNote], kScaleNames[gScale], kChordTypeNames[gChordType], gOctave);
+  snprintf(line, sizeof(line), "%s %s | %s | oct%d | inv%d",
+           getNoteName(gRootNote), kScaleNames[gScale], kChordTypeNames[gChordType], gOctave, gInversion);
   d.setTextColor(TFT_CYAN);
   d.drawString(line, 4, 58);
 
@@ -438,7 +454,9 @@ static void drawUi() {
 
   d.setTextColor(TFT_DARKGREY);
   d.drawString("1-8 chords  Fn=inv  ,/. edit", 4, 110);
-  d.drawString("; type  ' scale  [] key", 4, 122);
+  d.drawString("; type  ' scale  [] key  i inv", 4, 122);
+
+  gCanvas.pushSprite(0, 0);
 }
 
 static void nudgeEdit(int dir) {
@@ -552,6 +570,11 @@ static void handleKeyboard() {
           gUiDirty = true;
         }
         break;
+      case 'i':
+      case 'I':
+        gInversion = (gInversion % 3) + 1;
+        gUiDirty = true;
+        break;
       case '/':
       case '?':
         gEdit = (EditParam)((gEdit + 1) % EDIT_COUNT);
@@ -610,6 +633,7 @@ void setup() {
 
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setBrightness(80);
+  gCanvas.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
 
   // Re-apply rate on the board-configured ADV pins (ES8311 → speaker + 3.5mm).
   // Must end() first so begin() actually rebuilds I2S with the new rate.
@@ -650,3 +674,4 @@ void loop() {
   }
   delay(2);
 }
+
