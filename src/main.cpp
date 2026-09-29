@@ -57,12 +57,12 @@ struct Voice {
 
 struct SynthParams {
   Waveform wave = WAVE_SAW;
-  float cutoff = 0.35f;   // 0..1
-  float reso = 0.20f;     // 0..1
+  float cutoff = 0.45f;   // 0..1
+  float reso = 0.15f;     // 0..1
   float attackMs = 40.0f;
   float releaseMs = 320.0f;
   float detuneCents = 8.0f;
-  float volume = 0.55f;   // 0..1 master
+  float volume = 0.75f;   // 0..1 master
 };
 
 static Voice gVoices[kMaxVoices];
@@ -310,21 +310,19 @@ static bool anyVoiceSounding() {
 }
 
 static void renderBlock(int16_t* out, size_t frames) {
-  const float attack = fmaxf(1.0f, gParams.attackMs) * 0.001f * kSampleRate;
-  const float release = fmaxf(1.0f, gParams.releaseMs) * 0.001f * kSampleRate;
-  const float attackInc = 1.0f / attack;
-  const float releaseInc = 1.0f / release;
-
-  // One-pole lowpass with mild reso feedback (shared for CPU)
+  // Render directly on gVoices. Avoid per-sample spinlocks — those starve
+  // the Speaker I2S task and mute the Cardputer ADV.
+  const float attackInc = 1.0f / fmaxf(1.0f, gParams.attackMs * 0.001f * kSampleRate);
+  const float releaseInc = 1.0f / fmaxf(1.0f, gParams.releaseMs * 0.001f * kSampleRate);
   static float lp = 0.0f;
   static float bp = 0.0f;
-  const float f = clampf(gParams.cutoff * gParams.cutoff, 0.002f, 0.95f);
-  const float q = clampf(gParams.reso * 0.95f, 0.0f, 0.92f);
-  const float master = gParams.volume * 0.22f;
+  const float f = clampf(gParams.cutoff * gParams.cutoff, 0.01f, 0.95f);
+  const float q = clampf(gParams.reso * 0.9f, 0.0f, 0.9f);
+  const float master = gParams.volume * 0.45f;
+  const Waveform wave = gParams.wave;
 
   for (size_t n = 0; n < frames; n++) {
     float mix = 0.0f;
-    portENTER_CRITICAL(&gAudioMux);
     for (int i = 0; i < kMaxVoices; i++) {
       Voice& v = gVoices[i];
       if (!v.active) continue;
@@ -341,47 +339,42 @@ static void renderBlock(int16_t* out, size_t frames) {
         }
       }
 
-      float s = oscSample(v.phase, gParams.wave);
-      s += oscSample(v.phase2, gParams.wave) * 0.85f;
-      mix += s * v.env * v.velocity;
+      float s = oscSample(v.phase, wave);
+      s += oscSample(v.phase2, wave) * 0.85f;
+      mix += s * 0.5f * v.env * v.velocity;
 
       v.phase += v.incr;
       if (v.phase >= 1.0f) v.phase -= 1.0f;
       v.phase2 += v.incr2;
       if (v.phase2 >= 1.0f) v.phase2 -= 1.0f;
     }
-    portEXIT_CRITICAL(&gAudioMux);
 
-    // State-variable-ish lowpass
+    // Lowpass (lp). Bandpass was nearly inaudible on the tiny speaker.
     lp += f * (mix - lp - q * bp);
     bp += f * (lp - bp);
-    float sample = bp;
-    sample *= master;
-
+    float sample = lp * master;
     if (sample > 1.0f) sample = 1.0f;
     if (sample < -1.0f) sample = -1.0f;
-    out[n] = (int16_t)(sample * 30000.0f);
+    out[n] = (int16_t)(sample * 28000.0f);
   }
 }
 
 static void audioTask(void*) {
-  // Wait until a chord is actually sounding — no idle stream, no boot tone.
+  // Keep a continuous silent stream so the ES8311/I2S path stays armed.
+  // Output is digital zero until a chord gate opens — no boot tone.
   while (true) {
-    if (!anyVoiceSounding()) {
+    const int idx = gWriteBuf;
+    if (anyVoiceSounding()) {
+      gAudioRunning = true;
+      renderBlock(gAudioBuf[idx], kBufferFrames);
+    } else {
       gAudioRunning = false;
-      vTaskDelay(pdMS_TO_TICKS(5));
-      continue;
+      memset(gAudioBuf[idx], 0, sizeof(gAudioBuf[idx]));
     }
 
-    gAudioRunning = true;
-    const int idx = gWriteBuf;
-    renderBlock(gAudioBuf[idx], kBufferFrames);
-
-    // Queue until the speaker accepts the buffer (non-blocking API).
     while (!M5Cardputer.Speaker.playRaw(
-             gAudioBuf[idx], kBufferFrames, kSampleRate, false, 1, 0, false)) {
+             gAudioBuf[idx], kBufferFrames, kSampleRate, false, 1, -1, false)) {
       vTaskDelay(1);
-      if (!anyVoiceSounding() && !gAudioRunning) break;
     }
     gWriteBuf = (gWriteBuf + 1) % kBufferCount;
   }
@@ -612,25 +605,39 @@ static void handleKeyboard() {
 
 void setup() {
   auto cfg = M5.config();
+  cfg.internal_spk = true;
   M5Cardputer.begin(cfg, true);
 
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setBrightness(80);
 
-  // Speaker + ES8311 path also drives the 3.5mm jack.
-  auto spk = M5Cardputer.Speaker.config();
-  spk.sample_rate = kSampleRate;
-  spk.stereo = false;
-  spk.task_priority = 5;
-  M5Cardputer.Speaker.config(spk);
-  M5Cardputer.Speaker.begin();
-  M5Cardputer.Speaker.setVolume((uint8_t)(gParams.volume * 200.0f));
-  // Do NOT tone() or playRaw on boot — stay silent until a pad is pressed.
+  // Re-apply rate on the board-configured ADV pins (ES8311 → speaker + 3.5mm).
+  // Must end() first so begin() actually rebuilds I2S with the new rate.
+  {
+    auto spk = M5Cardputer.Speaker.config();
+    M5Cardputer.Speaker.end();
+    spk.sample_rate = kSampleRate;
+    spk.stereo = false;
+    spk.task_priority = 5;
+    spk.dma_buf_count = 8;
+    spk.dma_buf_len = 256;
+    M5Cardputer.Speaker.config(spk);
+    M5Cardputer.Speaker.begin();
+    M5Cardputer.Speaker.setVolume(200);
+  }
 
-  strncpy(gLastChordName, "Ready", sizeof(gLastChordName) - 1);
+  const auto board = M5.getBoard();
+  if (board == m5::board_t::board_M5CardputerADV) {
+    strncpy(gLastChordName, "Ready ADV", sizeof(gLastChordName) - 1);
+  } else if (board == m5::board_t::board_M5Cardputer) {
+    strncpy(gLastChordName, "Ready (v1)", sizeof(gLastChordName) - 1);
+  } else {
+    snprintf(gLastChordName, sizeof(gLastChordName), "Board %d", (int)board);
+  }
   strncpy(gLastNotes, "press 1-8", sizeof(gLastNotes) - 1);
   drawUi();
 
+  // Speaker task is priority 5; keep synth feed slightly below it on core 1.
   xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 4, &gAudioTask, 1);
 }
 
