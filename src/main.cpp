@@ -1,10 +1,21 @@
 #include <M5Cardputer.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
-// CardSynth — 4-voice editable pad synth with MPK-style chord pads.
-// Silent until a chord pad is pressed. Audio goes through ES8311 → speaker
-// and 3.5mm jack (jack insertion mutes the speaker amp in hardware).
+// CardSynth — 4-voice polyphonic pad & chord synth for M5Stack Cardputer.
+// Features:
+// 1. 4-voice Polyphony with dual detuned PolyBLEP anti-aliased oscillators.
+// 2. Dynamic Filter Envelope Modulation (VCF Attack/Decay) for plucks, brass & ambient sweeps.
+// 3. Strummer & Multi-Pattern Arpeggiator with Tap Tempo (Spacebar).
+// 4. 8 MPK-style chord pads (keys 1-8) with Fn-inversion control.
+// 5. Flicker-free double-buffered M5Canvas UI.
+//
+// Future Roadmap (Saved for later):
+// - Stereo Tape Delay / Reverb engine (PSRAM backed)
+// - Preset Manager (Factory patches + flash saving)
+// - USB & Bluetooth BLE MIDI Controller / Sound Module
+// - Step Sequencer / Chord Progression Looper
 
 static constexpr uint32_t kSampleRate = 44100;
 static constexpr size_t kBufferFrames = 256;
@@ -17,7 +28,7 @@ enum Waveform : uint8_t { WAVE_SAW = 0, WAVE_SQUARE, WAVE_TRIANGLE, WAVE_COUNT }
 enum ChordType : uint8_t {
   CHORD_TRIAD = 0,  // 1-3-5 in scale
   CHORD_ADD7,       // 1-3-5-7 in scale
-  CHORD_ADD79,      // 1-3-5-7-9 (uses 4 notes: drop 5th for voice limit)
+  CHORD_ADD79,      // 1-3-5-7-9 (drop 5th for 4-voice jazz voicing)
   CHORD_MAJ7,       // locked Maj7
   CHORD_MIN7,       // locked Min7
   CHORD_DOM7,       // locked Dom7
@@ -32,13 +43,27 @@ enum ScaleType : uint8_t {
   SCALE_PENT_MINOR,
   SCALE_COUNT
 };
+enum PlayMode : uint8_t {
+  PLAY_NORMAL = 0,
+  PLAY_STRUM_UP,
+  PLAY_STRUM_DN,
+  PLAY_ARP_UP,
+  PLAY_ARP_DN,
+  PLAY_ARP_UPDN,
+  PLAY_ARP_RAND,
+  PLAY_MODE_COUNT
+};
 enum EditParam : uint8_t {
   EDIT_CUTOFF = 0,
   EDIT_RESO,
+  EDIT_FILT_ENV,
+  EDIT_FILT_DEC,
   EDIT_ATTACK,
   EDIT_RELEASE,
   EDIT_DETUNE,
   EDIT_WAVE,
+  EDIT_BPM,
+  EDIT_STRUM,
   EDIT_VOLUME,
   EDIT_COUNT
 };
@@ -51,18 +76,21 @@ struct Voice {
   float incr = 0.0f;
   float incr2 = 0.0f;
   float env = 0.0f;
+  float fEnv = 0.0f;
   float velocity = 1.0f;
   uint32_t age = 0;
 };
 
 struct SynthParams {
   Waveform wave = WAVE_SAW;
-  float cutoff = 0.70f;   // 0..1 (open, bright and clear by default)
-  float reso = 0.10f;     // 0..1
-  float attackMs = 30.0f;
+  float cutoff = 0.65f;       // Base cutoff (0..1)
+  float reso = 0.12f;         // Resonance (0..1)
+  float filtEnv = 0.55f;      // Filter envelope modulation amount (0..1)
+  float filtDecayMs = 280.0f; // Filter decay time (10..2000 ms)
+  float attackMs = 25.0f;
   float releaseMs = 350.0f;
   float detuneCents = 6.0f;
-  float volume = 0.80f;   // 0..1 master
+  float volume = 0.80f;       // Master volume (0..1)
 };
 
 static Voice gVoices[kMaxVoices];
@@ -79,14 +107,34 @@ static M5Canvas gCanvas(&M5Cardputer.Display);
 static uint8_t gRootNote = 0;  // 0=C .. 11=B
 static ScaleType gScale = SCALE_MAJOR;
 static ChordType gChordType = CHORD_TRIAD;
-static int gOctave = 3;       // MIDI octave for pad root
-static int gInversion = 1;    // 1st/2nd/3rd when Fn held
+static PlayMode gPlayMode = PLAY_NORMAL;
+static int gOctave = 3;        // MIDI octave for pad root
+static int gInversion = 1;     // 1st/2nd/3rd when Fn held
 static EditParam gEdit = EDIT_CUTOFF;
+static int gBpm = 120;         // Arpeggiator tempo (40..240 BPM)
+static int gStrumSpeedMs = 35; // Strum interval between notes (10..100 ms)
+
 static char gLastChordName[24] = "-";
 static char gLastNotes[32] = "";
 static bool gUiDirty = true;
 static bool gPadDown[kPadCount] = {};
 static int gActivePad = -1;
+
+// Strummer and Arpeggiator state
+struct ScheduledNote {
+  bool pending = false;
+  uint32_t triggerTime = 0;
+  int midi = 0;
+  float velocity = 1.0f;
+};
+static ScheduledNote gStrumQueue[kMaxChordNotes];
+
+static int gCurrentChordNotes[kMaxChordNotes] = {};
+static int gCurrentChordCount = 0;
+static uint32_t gLastArpStep = 0;
+static int gArpIndex = 0;
+static int gArpDir = 1;
+static uint32_t gLastTapTime = 0;
 
 static const char* kNoteNames[] = {
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
@@ -98,8 +146,14 @@ static const char* kChordTypeNames[] = {
   "Triad", "+7", "+7+9", "Maj7", "Min7", "Dom7"
 };
 static const char* kWaveNames[] = { "Saw", "Square", "Tri" };
+static const char* kPlayModeNames[] = {
+  "Poly", "Strum Up", "Strum Dn", "Arp Up", "Arp Dn", "Arp UpDn", "Arp Rand"
+};
+static const char* kPlayModeBadges[] = {
+  "POLY", "STRUM+", "STRUM-", "ARP+", "ARP-", "ARP+-", "ARP?"
+};
 static const char* kEditNames[] = {
-  "Cutoff", "Reso", "Attack", "Release", "Detune", "Wave", "Volume"
+  "Cutoff", "Reso", "F-Env", "F-Decay", "Attack", "Release", "Detune", "Wave", "BPM", "Strum", "Volume"
 };
 
 static inline const char* getNoteName(int midi) {
@@ -146,9 +200,6 @@ static inline float oscSample(float phase, float dt, Waveform w) {
   }
 }
 
-
-
-// Scale degree intervals from root (semitones), null-terminated by -1
 static const int8_t kScaleIntervals[SCALE_COUNT][8] = {
   {0, 2, 4, 5, 7, 9, 11, -1},  // major
   {0, 2, 3, 5, 7, 8, 10, -1},  // natural minor
@@ -210,7 +261,7 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
       push(degreeToMidi(degree + 6));
     }
     if (gChordType == CHORD_ADD79) {
-      // Prefer 1-3-7-9 under the 4-voice limit
+      // 1-3-7-9 voicing under 4-voice limit
       if (count == 5) {
         notes[2] = notes[3];
         notes[3] = notes[4];
@@ -234,8 +285,6 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
     push(rootMidi + 7);
     push(rootMidi + seventh);
   }
-
-  // Keep chords in natural harmonic register without muddy sub-octave drop
 
   // Inversion: rotate bottom notes up an octave
   int invSteps = invert ? gInversion : 0;
@@ -294,12 +343,13 @@ static void noteOn(int midi, float velocity = 1.0f) {
   }
   v.active = true;
   v.gate = true;
-  // Slightly randomize initial phase to prevent transient stacking spikes
+  // Phase randomization prevents constructive wave stacking
   v.phase = (float)(rand() % 1000) * 0.001f;
   v.phase2 = fmodf(v.phase + 0.37f, 1.0f);
   v.incr = hz / kSampleRate;
   v.incr2 = (hz * det) / kSampleRate;
   v.env = 0.0f;
+  v.fEnv = 1.0f; // Trigger filter envelope
   v.velocity = velocity;
   v.age = 0;
   portEXIT_CRITICAL(&gAudioMux);
@@ -313,15 +363,53 @@ static void allNotesOff() {
   portEXIT_CRITICAL(&gAudioMux);
 }
 
+static void clearStrumQueue() {
+  for (int i = 0; i < kMaxChordNotes; i++) {
+    gStrumQueue[i].pending = false;
+  }
+}
+
 static void playChordPad(int padIndex, bool invert) {
   int notes[kMaxChordNotes];
   int count = 0;
   char name[24];
   buildChordNotes(padIndex, invert, notes, &count, name, sizeof(name));
 
-  allNotesOff();
+  gCurrentChordCount = count;
   for (int i = 0; i < count; i++) {
-    noteOn(notes[i], 1.0f - i * 0.04f);
+    gCurrentChordNotes[i] = notes[i];
+  }
+
+  allNotesOff();
+  clearStrumQueue();
+
+  if (gPlayMode == PLAY_NORMAL) {
+    for (int i = 0; i < count; i++) {
+      noteOn(notes[i], 1.0f - i * 0.03f);
+    }
+  } else if (gPlayMode == PLAY_STRUM_UP) {
+    uint32_t now = millis();
+    for (int i = 0; i < count; i++) {
+      gStrumQueue[i].pending = true;
+      gStrumQueue[i].triggerTime = now + (uint32_t)(i * gStrumSpeedMs);
+      gStrumQueue[i].midi = notes[i];
+      gStrumQueue[i].velocity = 1.0f - i * 0.03f;
+    }
+  } else if (gPlayMode == PLAY_STRUM_DN) {
+    uint32_t now = millis();
+    for (int i = 0; i < count; i++) {
+      int noteIdx = count - 1 - i;
+      gStrumQueue[i].pending = true;
+      gStrumQueue[i].triggerTime = now + (uint32_t)(i * gStrumSpeedMs);
+      gStrumQueue[i].midi = notes[noteIdx];
+      gStrumQueue[i].velocity = 1.0f - i * 0.03f;
+    }
+  } else {
+    // Arpeggiator mode: reset step counter and trigger immediately
+    gArpIndex = (gPlayMode == PLAY_ARP_DN) ? (count - 1) : 0;
+    gArpDir = 1;
+    gLastArpStep = millis();
+    noteOn(gCurrentChordNotes[gArpIndex], 1.0f);
   }
 
   strncpy(gLastChordName, name, sizeof(gLastChordName) - 1);
@@ -337,6 +425,49 @@ static void playChordPad(int padIndex, bool invert) {
   gUiDirty = true;
 }
 
+static void updateStrumQueue() {
+  uint32_t now = millis();
+  for (int i = 0; i < kMaxChordNotes; i++) {
+    if (gStrumQueue[i].pending && now >= gStrumQueue[i].triggerTime) {
+      gStrumQueue[i].pending = false;
+      noteOn(gStrumQueue[i].midi, gStrumQueue[i].velocity);
+    }
+  }
+}
+
+static void updateArpeggiator() {
+  if (gActivePad < 0 || gPlayMode < PLAY_ARP_UP || gCurrentChordCount == 0) return;
+
+  uint32_t stepIntervalMs = 15000 / (uint32_t)gBpm; // 1/16th note rate
+  uint32_t now = millis();
+  if (now - gLastArpStep >= stepIntervalMs) {
+    gLastArpStep = now;
+
+    // Advance note index
+    if (gPlayMode == PLAY_ARP_UP) {
+      gArpIndex = (gArpIndex + 1) % gCurrentChordCount;
+    } else if (gPlayMode == PLAY_ARP_DN) {
+      gArpIndex = (gArpIndex + gCurrentChordCount - 1) % gCurrentChordCount;
+    } else if (gPlayMode == PLAY_ARP_UPDN) {
+      if (gCurrentChordCount > 1) {
+        gArpIndex += gArpDir;
+        if (gArpIndex >= gCurrentChordCount - 1) {
+          gArpIndex = gCurrentChordCount - 1;
+          gArpDir = -1;
+        } else if (gArpIndex <= 0) {
+          gArpIndex = 0;
+          gArpDir = 1;
+        }
+      }
+    } else if (gPlayMode == PLAY_ARP_RAND) {
+      gArpIndex = rand() % gCurrentChordCount;
+    }
+
+    allNotesOff();
+    noteOn(gCurrentChordNotes[gArpIndex], 1.0f);
+  }
+}
+
 static bool anyVoiceSounding() {
   for (int i = 0; i < kMaxVoices; i++) {
     if (gVoices[i].active) return true;
@@ -347,23 +478,21 @@ static bool anyVoiceSounding() {
 static void renderBlock(int16_t* out, size_t frames) {
   const float attackInc = 1.0f / fmaxf(1.0f, gParams.attackMs * 0.001f * kSampleRate);
   const float releaseInc = 1.0f / fmaxf(1.0f, gParams.releaseMs * 0.001f * kSampleRate);
+  const float filtDecInc = 1.0f / fmaxf(1.0f, gParams.filtDecayMs * 0.001f * kSampleRate);
+  
   static float lp = 0.0f;
   static float bp = 0.0f;
   static float hp_x = 0.0f;
   static float hp_y = 0.0f;
 
-  // Logarithmic musical cutoff curve (180 Hz to ~14.4 kHz)
-  const float cutoffHz = 180.0f * powf(80.0f, gParams.cutoff);
-  const float f = clampf(2.0f * sinf(3.14159265f * cutoffHz / (kSampleRate * 2.0f)), 0.01f, 0.70f);
-  const float q = clampf(1.0f - gParams.reso * 0.85f, 0.15f, 1.0f);
   const float master = gParams.volume * 0.80f;
   const Waveform wave = gParams.wave;
-
-  // Highpass filter coefficient (~105 Hz at 44.1 kHz to protect speaker and clean mud)
-  const float hp_r = 0.985f;
+  const float hp_r = 0.985f; // ~105 Hz highpass roll-off
 
   for (size_t n = 0; n < frames; n++) {
     float mix = 0.0f;
+    float maxFenv = 0.0f;
+
     for (int i = 0; i < kMaxVoices; i++) {
       Voice& v = gVoices[i];
       if (!v.active) continue;
@@ -380,7 +509,12 @@ static void renderBlock(int16_t* out, size_t frames) {
         }
       }
 
-      // Smooth anti-aliased oscillators
+      // Filter envelope decay
+      v.fEnv -= filtDecInc;
+      if (v.fEnv < 0.0f) v.fEnv = 0.0f;
+      if (v.fEnv > maxFenv) maxFenv = v.fEnv;
+
+      // Anti-aliased dual-oscillator voice
       float s = oscSample(v.phase, v.incr, wave);
       s += oscSample(v.phase2, v.incr2, wave) * 0.85f;
       mix += s * 0.25f * v.env * v.velocity;
@@ -391,13 +525,19 @@ static void renderBlock(int16_t* out, size_t frames) {
       if (v.phase2 >= 1.0f) v.phase2 -= 1.0f;
     }
 
-    // 2x oversampled Chamberlin lowpass filter
+    // Dynamic Filter Envelope calculation
+    float dynCutoff = clampf(gParams.cutoff + maxFenv * gParams.filtEnv * 0.40f, 0.02f, 1.0f);
+    float cutoffHz = 180.0f * powf(80.0f, dynCutoff);
+    float f = clampf(2.0f * sinf(3.14159265f * cutoffHz / (kSampleRate * 2.0f)), 0.01f, 0.70f);
+    float q = clampf(1.0f - gParams.reso * 0.85f, 0.15f, 1.0f);
+
+    // 2x oversampled Chamberlin filter
     for (int step = 0; step < 2; step++) {
       lp += f * (mix - lp - q * bp);
       bp += f * (lp - bp);
     }
 
-    // Highpass DC / sub-bass roll-off (~105 Hz)
+    // Highpass DC & sub-bass roll-off (~105 Hz)
     float hp_in = lp;
     hp_y = hp_in - hp_x + hp_r * hp_y;
     hp_x = hp_in;
@@ -410,7 +550,6 @@ static void renderBlock(int16_t* out, size_t frames) {
 
 static void audioTask(void*) {
   // Feed I2S continuously via dedicated virtual channel 0.
-  // Channel 0 ensures sequential queueing without 8-channel parallel comb-filtering.
   while (true) {
     const int idx = gWriteBuf;
     if (anyVoiceSounding()) {
@@ -429,33 +568,42 @@ static void audioTask(void*) {
   }
 }
 
-
 static void drawUi() {
   auto& d = gCanvas;
   d.fillScreen(TFT_BLACK);
   d.setTextDatum(top_left);
 
+  // Header Title & Play Mode Badge
   d.setTextColor(TFT_ORANGE);
   d.setTextSize(1);
   d.drawString("CardSynth", 4, 2);
 
+  d.setTextColor(gPlayMode == PLAY_NORMAL ? TFT_DARKGREY : TFT_GREEN);
+  char modeBadge[20];
+  snprintf(modeBadge, sizeof(modeBadge), "[%s %dBPM]", kPlayModeBadges[gPlayMode], gBpm);
+  d.drawString(modeBadge, 130, 2);
+
+  // Large Chord Name
   d.setTextColor(TFT_WHITE);
   d.setTextSize(2);
-  d.drawString(gLastChordName, 4, 18);
+  d.drawString(gLastChordName, 4, 16);
 
+  // Chord Notes
   d.setTextSize(1);
   d.setTextColor(TFT_LIGHTGREY);
-  d.drawString(gLastNotes, 4, 42);
+  d.drawString(gLastNotes, 4, 38);
 
-  char line[48];
+  // Scale & Transposition info
+  char line[56];
   snprintf(line, sizeof(line), "%s %s | %s | oct%d | inv%d",
            getNoteName(gRootNote), kScaleNames[gScale], kChordTypeNames[gChordType], gOctave, gInversion);
   d.setTextColor(TFT_CYAN);
-  d.drawString(line, 4, 58);
+  d.drawString(line, 4, 52);
 
+  // Active Edit Parameter & Value
   snprintf(line, sizeof(line), "Edit %s", kEditNames[gEdit]);
   d.setTextColor(TFT_YELLOW);
-  d.drawString(line, 4, 74);
+  d.drawString(line, 4, 68);
 
   switch (gEdit) {
     case EDIT_CUTOFF:
@@ -463,6 +611,12 @@ static void drawUi() {
       break;
     case EDIT_RESO:
       snprintf(line, sizeof(line), "%.0f%%", gParams.reso * 100.0f);
+      break;
+    case EDIT_FILT_ENV:
+      snprintf(line, sizeof(line), "%.0f%% (Mod Amt)", gParams.filtEnv * 100.0f);
+      break;
+    case EDIT_FILT_DEC:
+      snprintf(line, sizeof(line), "%.0f ms (F-Decay)", gParams.filtDecayMs);
       break;
     case EDIT_ATTACK:
       snprintf(line, sizeof(line), "%.0f ms", gParams.attackMs);
@@ -476,6 +630,12 @@ static void drawUi() {
     case EDIT_WAVE:
       snprintf(line, sizeof(line), "%s", kWaveNames[gParams.wave]);
       break;
+    case EDIT_BPM:
+      snprintf(line, sizeof(line), "%d BPM [Space: Tap]", gBpm);
+      break;
+    case EDIT_STRUM:
+      snprintf(line, sizeof(line), "%d ms (Strum Speed)", gStrumSpeedMs);
+      break;
     case EDIT_VOLUME:
       snprintf(line, sizeof(line), "%.0f%%", gParams.volume * 100.0f);
       break;
@@ -484,11 +644,12 @@ static void drawUi() {
       break;
   }
   d.setTextColor(TFT_WHITE);
-  d.drawString(line, 4, 90);
+  d.drawString(line, 4, 82);
 
+  // Quick Help Footer
   d.setTextColor(TFT_DARKGREY);
-  d.drawString("1-8 chords  Fn=inv  ,/. edit", 4, 110);
-  d.drawString("; type  ' scale  [] key  i inv", 4, 122);
+  d.drawString("1-8 chord  a:mode  spc:tap  ,/. edit", 4, 104);
+  d.drawString("; type  ' scale  [] key  i inv", 4, 118);
 
   gCanvas.pushSprite(0, 0);
 }
@@ -501,8 +662,14 @@ static void nudgeEdit(int dir) {
     case EDIT_RESO:
       gParams.reso = clampf(gParams.reso + dir * 0.03f, 0.0f, 0.95f);
       break;
+    case EDIT_FILT_ENV:
+      gParams.filtEnv = clampf(gParams.filtEnv + dir * 0.05f, 0.0f, 1.0f);
+      break;
+    case EDIT_FILT_DEC:
+      gParams.filtDecayMs = clampf(gParams.filtDecayMs + dir * 20.0f, 10.0f, 2000.0f);
+      break;
     case EDIT_ATTACK:
-      gParams.attackMs = clampf(gParams.attackMs + dir * 8.0f, 1.0f, 2000.0f);
+      gParams.attackMs = clampf(gParams.attackMs + dir * 6.0f, 1.0f, 2000.0f);
       break;
     case EDIT_RELEASE:
       gParams.releaseMs = clampf(gParams.releaseMs + dir * 20.0f, 10.0f, 4000.0f);
@@ -512,6 +679,12 @@ static void nudgeEdit(int dir) {
       break;
     case EDIT_WAVE:
       gParams.wave = (Waveform)((gParams.wave + dir + WAVE_COUNT) % WAVE_COUNT);
+      break;
+    case EDIT_BPM:
+      gBpm = (int)clampf((float)(gBpm + dir * 4), 40.0f, 240.0f);
+      break;
+    case EDIT_STRUM:
+      gStrumSpeedMs = (int)clampf((float)(gStrumSpeedMs + dir * 5), 10.0f, 100.0f);
       break;
     case EDIT_VOLUME: {
       gParams.volume = clampf(gParams.volume + dir * 0.04f, 0.0f, 1.0f);
@@ -543,13 +716,14 @@ static void handleKeyboard() {
       playChordPad(i, fn);
     }
     if (!nowDown[i] && gPadDown[i]) {
-      // Release this pad — if no other pad held, release notes.
+      // Release pad
       bool any = false;
       for (int j = 0; j < kPadCount; j++) {
         if (j != i && nowDown[j]) any = true;
       }
       if (!any) {
         allNotesOff();
+        clearStrumQueue();
         gActivePad = -1;
         gUiDirty = true;
       }
@@ -559,7 +733,22 @@ static void handleKeyboard() {
 
   if (!M5Cardputer.Keyboard.isPressed()) return;
 
-  // One-shot controls from character layer (ignore while only Fn held)
+  // Spacebar Tap-Tempo
+  if (st.space) {
+    uint32_t now = millis();
+    if (gLastTapTime > 0) {
+      uint32_t diff = now - gLastTapTime;
+      if (diff >= 200 && diff <= 2000) {
+        int tappedBpm = (int)(60000 / diff);
+        gBpm = (int)clampf((float)tappedBpm, 40.0f, 240.0f);
+        gEdit = EDIT_BPM;
+        gUiDirty = true;
+      }
+    }
+    gLastTapTime = now;
+  }
+
+  // One-shot controls from character layer
   for (auto c : st.word) {
     switch (c) {
       case ',':
@@ -569,6 +758,11 @@ static void handleKeyboard() {
       case '.':
       case '>':
         nudgeEdit(1);
+        break;
+      case 'a':
+      case 'A':
+        gPlayMode = (PlayMode)((gPlayMode + 1) % PLAY_MODE_COUNT);
+        gUiDirty = true;
         break;
       case ';':
       case ':':
@@ -624,6 +818,16 @@ static void handleKeyboard() {
         gEdit = EDIT_RESO;
         gUiDirty = true;
         break;
+      case 'f':
+      case 'F':
+        gEdit = EDIT_FILT_ENV;
+        gUiDirty = true;
+        break;
+      case 'd':
+      case 'D':
+        gEdit = EDIT_FILT_DEC;
+        gUiDirty = true;
+        break;
       case 'c':
       case 'C':
         gEdit = EDIT_ATTACK;
@@ -642,6 +846,16 @@ static void handleKeyboard() {
       case 'n':
       case 'N':
         gEdit = EDIT_WAVE;
+        gUiDirty = true;
+        break;
+      case 't':
+      case 'T':
+        gEdit = EDIT_BPM;
+        gUiDirty = true;
+        break;
+      case 's':
+      case 'S':
+        gEdit = EDIT_STRUM;
         gUiDirty = true;
         break;
       case 'm':
@@ -670,7 +884,6 @@ void setup() {
   gCanvas.createSprite(M5Cardputer.Display.width(), M5Cardputer.Display.height());
 
   // Re-apply rate on the board-configured ADV pins (ES8311 → speaker + 3.5mm).
-  // Must end() first so begin() actually rebuilds I2S with the new rate.
   {
     auto spk = M5Cardputer.Speaker.config();
     M5Cardputer.Speaker.end();
@@ -702,10 +915,11 @@ void setup() {
 void loop() {
   M5Cardputer.update();
   handleKeyboard();
+  updateStrumQueue();
+  updateArpeggiator();
   if (gUiDirty) {
     drawUi();
     gUiDirty = false;
   }
   delay(2);
 }
-
