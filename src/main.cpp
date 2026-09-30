@@ -6,9 +6,9 @@
 // Silent until a chord pad is pressed. Audio goes through ES8311 → speaker
 // and 3.5mm jack (jack insertion mutes the speaker amp in hardware).
 
-static constexpr uint32_t kSampleRate = 22050;
+static constexpr uint32_t kSampleRate = 44100;
 static constexpr size_t kBufferFrames = 256;
-static constexpr size_t kBufferCount = 3;
+static constexpr size_t kBufferCount = 4;
 static constexpr int kMaxVoices = 4;
 static constexpr int kMaxChordNotes = 4;
 static constexpr int kPadCount = 8;
@@ -57,12 +57,12 @@ struct Voice {
 
 struct SynthParams {
   Waveform wave = WAVE_SAW;
-  float cutoff = 0.45f;   // 0..1
-  float reso = 0.15f;     // 0..1
-  float attackMs = 40.0f;
-  float releaseMs = 320.0f;
-  float detuneCents = 8.0f;
-  float volume = 0.75f;   // 0..1 master
+  float cutoff = 0.70f;   // 0..1 (open, bright and clear by default)
+  float reso = 0.10f;     // 0..1
+  float attackMs = 30.0f;
+  float releaseMs = 350.0f;
+  float detuneCents = 6.0f;
+  float volume = 0.80f;   // 0..1 master
 };
 
 static Voice gVoices[kMaxVoices];
@@ -112,6 +112,40 @@ static inline float softClip(float x) {
   if (x <= -1.5f) return -1.0f;
   return x - (x * x * x) * (1.0f / 3.0f);
 }
+
+// PolyBLEP anti-aliasing to remove digital edge harshness
+static inline float polyBlep(float t, float dt) {
+  if (t < dt) {
+    t /= dt;
+    return t + t - t * t - 1.0f;
+  } else if (t > 1.0f - dt) {
+    t = (t - 1.0f) / dt;
+    return t * t + t + t + 1.0f;
+  }
+  return 0.0f;
+}
+
+static inline float oscSample(float phase, float dt, Waveform w) {
+  switch (w) {
+    case WAVE_SQUARE: {
+      float naive = phase < 0.5f ? 1.0f : -1.0f;
+      naive += polyBlep(phase, dt);
+      float p2 = phase + 0.5f;
+      if (p2 >= 1.0f) p2 -= 1.0f;
+      naive -= polyBlep(p2, dt);
+      return naive;
+    }
+    case WAVE_TRIANGLE:
+      return 1.0f - 4.0f * fabsf(phase - 0.5f);
+    case WAVE_SAW:
+    default: {
+      float naive = 2.0f * phase - 1.0f;
+      naive -= polyBlep(phase, dt);
+      return naive;
+    }
+  }
+}
+
 
 
 // Scale degree intervals from root (semitones), null-terminated by -1
@@ -201,8 +235,7 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
     push(rootMidi + seventh);
   }
 
-  // Spread: drop root an octave for clearer speaker tone
-  notes[0] -= 12;
+  // Keep chords in natural harmonic register without muddy sub-octave drop
 
   // Inversion: rotate bottom notes up an octave
   int invSteps = invert ? gInversion : 0;
@@ -261,8 +294,9 @@ static void noteOn(int midi, float velocity = 1.0f) {
   }
   v.active = true;
   v.gate = true;
-  v.phase = 0.0f;
-  v.phase2 = 0.37f;
+  // Slightly randomize initial phase to prevent transient stacking spikes
+  v.phase = (float)(rand() % 1000) * 0.001f;
+  v.phase2 = fmodf(v.phase + 0.37f, 1.0f);
   v.incr = hz / kSampleRate;
   v.incr2 = (hz * det) / kSampleRate;
   v.env = 0.0f;
@@ -303,18 +337,6 @@ static void playChordPad(int padIndex, bool invert) {
   gUiDirty = true;
 }
 
-static float oscSample(float phase, Waveform w) {
-  switch (w) {
-    case WAVE_SQUARE:
-      return phase < 0.5f ? 1.0f : -1.0f;
-    case WAVE_TRIANGLE:
-      return 1.0f - 4.0f * fabsf(phase - 0.5f);
-    case WAVE_SAW:
-    default:
-      return 2.0f * phase - 1.0f;
-  }
-}
-
 static bool anyVoiceSounding() {
   for (int i = 0; i < kMaxVoices; i++) {
     if (gVoices[i].active) return true;
@@ -323,17 +345,22 @@ static bool anyVoiceSounding() {
 }
 
 static void renderBlock(int16_t* out, size_t frames) {
-  // Render directly on gVoices. Avoid per-sample spinlocks — those starve
-  // the Speaker I2S task and mute the Cardputer ADV.
   const float attackInc = 1.0f / fmaxf(1.0f, gParams.attackMs * 0.001f * kSampleRate);
   const float releaseInc = 1.0f / fmaxf(1.0f, gParams.releaseMs * 0.001f * kSampleRate);
   static float lp = 0.0f;
   static float bp = 0.0f;
-  // Stable 2x-stepped Chamberlin coefficients
-  const float f = clampf(gParams.cutoff * 0.45f, 0.005f, 0.45f);
-  const float q = clampf(gParams.reso * 0.85f, 0.0f, 0.85f);
-  const float master = gParams.volume * 0.45f;
+  static float hp_x = 0.0f;
+  static float hp_y = 0.0f;
+
+  // Logarithmic musical cutoff curve (180 Hz to ~14.4 kHz)
+  const float cutoffHz = 180.0f * powf(80.0f, gParams.cutoff);
+  const float f = clampf(2.0f * sinf(3.14159265f * cutoffHz / (kSampleRate * 2.0f)), 0.01f, 0.70f);
+  const float q = clampf(1.0f - gParams.reso * 0.85f, 0.15f, 1.0f);
+  const float master = gParams.volume * 0.80f;
   const Waveform wave = gParams.wave;
+
+  // Highpass filter coefficient (~105 Hz at 44.1 kHz to protect speaker and clean mud)
+  const float hp_r = 0.985f;
 
   for (size_t n = 0; n < frames; n++) {
     float mix = 0.0f;
@@ -353,9 +380,10 @@ static void renderBlock(int16_t* out, size_t frames) {
         }
       }
 
-      float s = oscSample(v.phase, wave);
-      s += oscSample(v.phase2, wave) * 0.85f;
-      mix += s * 0.5f * v.env * v.velocity;
+      // Smooth anti-aliased oscillators
+      float s = oscSample(v.phase, v.incr, wave);
+      s += oscSample(v.phase2, v.incr2, wave) * 0.85f;
+      mix += s * 0.25f * v.env * v.velocity;
 
       v.phase += v.incr;
       if (v.phase >= 1.0f) v.phase -= 1.0f;
@@ -363,21 +391,26 @@ static void renderBlock(int16_t* out, size_t frames) {
       if (v.phase2 >= 1.0f) v.phase2 -= 1.0f;
     }
 
-    // 2x oversampled Chamberlin lowpass for rock-solid stability
+    // 2x oversampled Chamberlin lowpass filter
     for (int step = 0; step < 2; step++) {
       lp += f * (mix - lp - q * bp);
       bp += f * (lp - bp);
     }
 
-    // Soft saturation for warm analog-style headroom
-    float sample = softClip(lp * master);
+    // Highpass DC / sub-bass roll-off (~105 Hz)
+    float hp_in = lp;
+    hp_y = hp_in - hp_x + hp_r * hp_y;
+    hp_x = hp_in;
+
+    // Warm analog saturation soft-clipper
+    float sample = softClip(hp_y * master);
     out[n] = (int16_t)(sample * 28000.0f);
   }
 }
 
 static void audioTask(void*) {
-  // Keep a continuous silent stream so the ES8311/I2S path stays armed.
-  // Output is digital zero until a chord gate opens — no boot tone.
+  // Feed I2S continuously via dedicated virtual channel 0.
+  // Channel 0 ensures sequential queueing without 8-channel parallel comb-filtering.
   while (true) {
     const int idx = gWriteBuf;
     if (anyVoiceSounding()) {
@@ -389,12 +422,13 @@ static void audioTask(void*) {
     }
 
     while (!M5Cardputer.Speaker.playRaw(
-             gAudioBuf[idx], kBufferFrames, kSampleRate, false, 1, -1, false)) {
+             gAudioBuf[idx], kBufferFrames, kSampleRate, false, 1, 0, false)) {
       vTaskDelay(1);
     }
     gWriteBuf = (gWriteBuf + 1) % kBufferCount;
   }
 }
+
 
 static void drawUi() {
   auto& d = gCanvas;
