@@ -3,18 +3,24 @@
 #include <string.h>
 #include <stdlib.h>
 
-// CardSynth — 4-voice polyphonic pad & chord synth for M5Stack Cardputer.
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// CardSynth — 4-voice polyphonic pad synth & wireless BLE MIDI controller for M5Cardputer.
 // Features:
 // 1. 4-voice Polyphony with dual detuned PolyBLEP anti-aliased oscillators.
 // 2. Dynamic Filter Envelope Modulation (VCF Attack/Decay) for plucks, brass & ambient sweeps.
 // 3. Strummer & Multi-Pattern Arpeggiator with Tap Tempo (Spacebar).
-// 4. 8 MPK-style chord pads (keys 1-8) with Fn-inversion control.
-// 5. Flicker-free double-buffered M5Canvas UI.
+// 4. Wireless Bluetooth BLE MIDI Out (connects to Mac, iOS, iPad, Windows, DAWs).
+// 5. Parameter MIDI CC automation (Cutoff CC#74, Reso CC#71, Volume CC#7).
+// 6. 8 MPK-style chord pads (keys 1-8) with Fn-inversion control.
+// 7. Flicker-free double-buffered M5Canvas UI.
 //
 // Future Roadmap (Saved for later):
 // - Stereo Tape Delay / Reverb engine (PSRAM backed)
 // - Preset Manager (Factory patches + flash saving)
-// - USB & Bluetooth BLE MIDI Controller / Sound Module
 // - Step Sequencer / Chord Progression Looper
 
 static constexpr uint32_t kSampleRate = 44100;
@@ -23,6 +29,12 @@ static constexpr size_t kBufferCount = 4;
 static constexpr int kMaxVoices = 4;
 static constexpr int kMaxChordNotes = 4;
 static constexpr int kPadCount = 8;
+
+#define MIDI_SERVICE_UUID        "03b80e5a-ede8-4b33-a085-331652f1011c"
+#define MIDI_CHARACTERISTIC_UUID "7772e5db-3868-4112-a1a9-f2669d106bf3"
+
+static BLECharacteristic* pMidiCharacteristic = nullptr;
+static volatile bool gBleConnected = false;
 
 enum Waveform : uint8_t { WAVE_SAW = 0, WAVE_SQUARE, WAVE_TRIANGLE, WAVE_COUNT };
 enum ChordType : uint8_t {
@@ -71,6 +83,7 @@ enum EditParam : uint8_t {
 struct Voice {
   volatile bool active = false;
   volatile bool gate = false;
+  int midiNote = 60;
   float phase = 0.0f;
   float phase2 = 0.0f;
   float incr = 0.0f;
@@ -155,6 +168,63 @@ static const char* kPlayModeBadges[] = {
 static const char* kEditNames[] = {
   "Cutoff", "Reso", "F-Env", "F-Decay", "Attack", "Release", "Detune", "Wave", "BPM", "Strum", "Volume"
 };
+
+class BleServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    gBleConnected = true;
+    gUiDirty = true;
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    gBleConnected = false;
+    gUiDirty = true;
+    BLEDevice::startAdvertising();
+  }
+};
+
+static inline void midiSendNoteOn(uint8_t note, uint8_t vel = 100) {
+  if (gBleConnected && pMidiCharacteristic) {
+    uint32_t now = millis();
+    uint8_t packet[5] = {
+      (uint8_t)(0x80 | ((now >> 7) & 0x3F)),
+      (uint8_t)(0x80 | (now & 0x7F)),
+      0x90, // Note On channel 1
+      note,
+      vel
+    };
+    pMidiCharacteristic->setValue(packet, 5);
+    pMidiCharacteristic->notify();
+  }
+}
+
+static inline void midiSendNoteOff(uint8_t note) {
+  if (gBleConnected && pMidiCharacteristic) {
+    uint32_t now = millis();
+    uint8_t packet[5] = {
+      (uint8_t)(0x80 | ((now >> 7) & 0x3F)),
+      (uint8_t)(0x80 | (now & 0x7F)),
+      0x80, // Note Off channel 1
+      note,
+      0
+    };
+    pMidiCharacteristic->setValue(packet, 5);
+    pMidiCharacteristic->notify();
+  }
+}
+
+static inline void midiSendCC(uint8_t cc, uint8_t val) {
+  if (gBleConnected && pMidiCharacteristic) {
+    uint32_t now = millis();
+    uint8_t packet[5] = {
+      (uint8_t)(0x80 | ((now >> 7) & 0x3F)),
+      (uint8_t)(0x80 | (now & 0x7F)),
+      0xB0, // Control Change channel 1
+      cc,
+      val
+    };
+    pMidiCharacteristic->setValue(packet, 5);
+    pMidiCharacteristic->notify();
+  }
+}
 
 static inline const char* getNoteName(int midi) {
   int idx = ((midi % 12) + 12) % 12;
@@ -343,6 +413,7 @@ static void noteOn(int midi, float velocity = 1.0f) {
   }
   v.active = true;
   v.gate = true;
+  v.midiNote = midi;
   // Phase randomization prevents constructive wave stacking
   v.phase = (float)(rand() % 1000) * 0.001f;
   v.phase2 = fmodf(v.phase + 0.37f, 1.0f);
@@ -353,11 +424,17 @@ static void noteOn(int midi, float velocity = 1.0f) {
   v.velocity = velocity;
   v.age = 0;
   portEXIT_CRITICAL(&gAudioMux);
+
+  // Broadcast wireless BLE MIDI note
+  midiSendNoteOn((uint8_t)midi, (uint8_t)(velocity * 127.0f));
 }
 
 static void allNotesOff() {
   portENTER_CRITICAL(&gAudioMux);
   for (int i = 0; i < kMaxVoices; i++) {
+    if (gVoices[i].active) {
+      midiSendNoteOff((uint8_t)gVoices[i].midiNote);
+    }
     gVoices[i].gate = false;
   }
   portEXIT_CRITICAL(&gAudioMux);
@@ -573,12 +650,15 @@ static void drawUi() {
   d.fillScreen(TFT_BLACK);
   d.setTextDatum(top_left);
 
-  // Header Title & Play Mode Badge
+  // Header Title & Play Mode / BLE Badge
   d.setTextColor(TFT_ORANGE);
   d.setTextSize(1);
   d.drawString("CardSynth", 4, 2);
 
-  d.setTextColor(gPlayMode == PLAY_NORMAL ? TFT_DARKGREY : TFT_GREEN);
+  d.setTextColor(gBleConnected ? TFT_GREEN : TFT_DARKGREY);
+  d.drawString(gBleConnected ? "BLE:ON" : "BLE:OFF", 74, 2);
+
+  d.setTextColor(gPlayMode == PLAY_NORMAL ? TFT_DARKGREY : TFT_CYAN);
   char modeBadge[20];
   snprintf(modeBadge, sizeof(modeBadge), "[%s %dBPM]", kPlayModeBadges[gPlayMode], gBpm);
   d.drawString(modeBadge, 130, 2);
@@ -607,10 +687,10 @@ static void drawUi() {
 
   switch (gEdit) {
     case EDIT_CUTOFF:
-      snprintf(line, sizeof(line), "%.0f%%", gParams.cutoff * 100.0f);
+      snprintf(line, sizeof(line), "%.0f%% [CC#74]", gParams.cutoff * 100.0f);
       break;
     case EDIT_RESO:
-      snprintf(line, sizeof(line), "%.0f%%", gParams.reso * 100.0f);
+      snprintf(line, sizeof(line), "%.0f%% [CC#71]", gParams.reso * 100.0f);
       break;
     case EDIT_FILT_ENV:
       snprintf(line, sizeof(line), "%.0f%% (Mod Amt)", gParams.filtEnv * 100.0f);
@@ -637,7 +717,7 @@ static void drawUi() {
       snprintf(line, sizeof(line), "%d ms (Strum Speed)", gStrumSpeedMs);
       break;
     case EDIT_VOLUME:
-      snprintf(line, sizeof(line), "%.0f%%", gParams.volume * 100.0f);
+      snprintf(line, sizeof(line), "%.0f%% [CC#7]", gParams.volume * 100.0f);
       break;
     default:
       line[0] = 0;
@@ -658,9 +738,11 @@ static void nudgeEdit(int dir) {
   switch (gEdit) {
     case EDIT_CUTOFF:
       gParams.cutoff = clampf(gParams.cutoff + dir * 0.03f, 0.02f, 1.0f);
+      midiSendCC(74, (uint8_t)(gParams.cutoff * 127.0f));
       break;
     case EDIT_RESO:
       gParams.reso = clampf(gParams.reso + dir * 0.03f, 0.0f, 0.95f);
+      midiSendCC(71, (uint8_t)(gParams.reso * 127.0f));
       break;
     case EDIT_FILT_ENV:
       gParams.filtEnv = clampf(gParams.filtEnv + dir * 0.05f, 0.0f, 1.0f);
@@ -689,6 +771,7 @@ static void nudgeEdit(int dir) {
     case EDIT_VOLUME: {
       gParams.volume = clampf(gParams.volume + dir * 0.04f, 0.0f, 1.0f);
       M5Cardputer.Speaker.setVolume((uint8_t)(gParams.volume * 200.0f));
+      midiSendCC(7, (uint8_t)(gParams.volume * 127.0f));
       break;
     }
     default:
@@ -896,6 +979,27 @@ void setup() {
     M5Cardputer.Speaker.begin();
     M5Cardputer.Speaker.setVolume(200);
   }
+
+  // Initialize Wireless Bluetooth BLE MIDI
+  BLEDevice::init("CardSynth MIDI");
+  BLEServer* pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new BleServerCallbacks());
+  BLEService* pService = pServer->createService(BLEUUID(MIDI_SERVICE_UUID));
+  pMidiCharacteristic = pService->createCharacteristic(
+    BLEUUID(MIDI_CHARACTERISTIC_UUID),
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_NOTIFY |
+    BLECharacteristic::PROPERTY_WRITE_NR
+  );
+  pMidiCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(MIDI_SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06); // Fast iPhone/Mac connection interval
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
 
   const auto board = M5.getBoard();
   if (board == m5::board_t::board_M5CardputerADV) {
