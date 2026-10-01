@@ -4,6 +4,16 @@ A 4-voice polyphonic synthesizer, chord machine, and wireless Bluetooth BLE-MIDI
 
 ---
 
+## About
+
+**CardSynth** transforms the M5Stack Cardputer into a standalone, portable pocket groove synthesizer and wireless MIDI controller. 
+
+Designed for quick musical sketching and tactile live jamming, it pairs an MPK-style chord pad engine on the top row with a full 2-octave chromatic QWERTY keyboard for soloing. The audio engine runs at **44.1 kHz** using dual detuned PolyBLEP anti-aliased oscillators, a resonant low-pass filter with dedicated envelope modulation, a 4-stage ADSR amp envelope, an LFO matrix, and a multi-pattern arpeggiator/strummer.
+
+When paired over Bluetooth, CardSynth acts as a wireless BLE-MIDI controller with real-time parameter CC automation for DAWs and mobile synths on Mac, iOS, iPad, Windows, and Android.
+
+---
+
 ## Features
 
 - **Dual Playing Modes**:
@@ -115,4 +125,24 @@ Built using [PlatformIO](https://platformio.org/).
 
 ## License
 
-MIT
+MIT License
+
+Copyright (c) 2026 CircuitGhost
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
