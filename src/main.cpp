@@ -8,20 +8,22 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-// CardSynth — 4-voice polyphonic pad synth & wireless BLE MIDI controller for M5Cardputer.
+// CardSynth — 4-voice polyphonic pad synth, solo piano keyboard & wireless BLE MIDI controller for M5Cardputer.
 // Features:
-// 1. 4-voice Polyphony with dual detuned PolyBLEP anti-aliased oscillators.
-// 2. Dynamic Filter Envelope Modulation (VCF Attack/Decay) for plucks, brass & ambient sweeps.
-// 3. Strummer & Multi-Pattern Arpeggiator with Tap Tempo (Spacebar).
-// 4. Wireless Bluetooth BLE MIDI Out (connects to Mac, iOS, iPad, Windows, DAWs).
-// 5. Parameter MIDI CC automation (Cutoff CC#74, Reso CC#71, Volume CC#7).
-// 6. 8 MPK-style chord pads (keys 1-8) with Fn-inversion control.
-// 7. Flicker-free double-buffered M5Canvas UI.
-//
-// Future Roadmap (Saved for later):
-// - Stereo Tape Delay / Reverb engine (PSRAM backed)
-// - Preset Manager (Factory patches + flash saving)
-// - Step Sequencer / Chord Progression Looper
+// 1. Dual Play Engine:
+//    - Top row (1-8): 8 Smart Chord Pads with diatonic/locked harmony & Fn inversions.
+//    - QWERTY Piano: 2-octave chromatic keyboard (A-S-D-F-G-H-J-K-L white keys, W-E-T-Y-U-O-P black keys).
+// 2. Sound Design Engine:
+//    - 4-Voice Polyphony with dual detuned PolyBLEP anti-aliased oscillators + Sub-Oscillator.
+//    - Full 4-stage ADSR Amp Envelope (Attack, Decay, Sustain, Release).
+//    - Dynamic Resonant Filter (VCF) with dedicated Filter Envelope Modulation.
+//    - LFO Modulation Matrix (Cutoff Wah, Pitch Vibrato, Volume Tremolo).
+// 3. Visual UI Overhaul (240x135 Double-Buffered M5Canvas):
+//    - Real-Time Live Audio Oscilloscope.
+//    - Animated Filter Response Curve with live VCF envelope sweep.
+//    - 8-Pad Graphical Grid with active press & arpeggiator tracer.
+// 4. Strummer & Multi-Pattern Arpeggiator with Tap-Tempo on Spacebar.
+// 5. Wireless Bluetooth BLE MIDI Out with real-time CC automation.
 
 static constexpr uint32_t kSampleRate = 44100;
 static constexpr size_t kBufferFrames = 256;
@@ -65,14 +67,27 @@ enum PlayMode : uint8_t {
   PLAY_ARP_RAND,
   PLAY_MODE_COUNT
 };
+enum LfoTarget : uint8_t {
+  LFO_OFF = 0,
+  LFO_CUTOFF,
+  LFO_PITCH,
+  LFO_VOLUME,
+  LFO_TARGET_COUNT
+};
 enum EditParam : uint8_t {
   EDIT_CUTOFF = 0,
   EDIT_RESO,
   EDIT_FILT_ENV,
   EDIT_FILT_DEC,
   EDIT_ATTACK,
+  EDIT_DECAY,
+  EDIT_SUSTAIN,
   EDIT_RELEASE,
+  EDIT_LFO_TARGET,
+  EDIT_LFO_RATE,
+  EDIT_LFO_DEPTH,
   EDIT_DETUNE,
+  EDIT_SUB,
   EDIT_WAVE,
   EDIT_BPM,
   EDIT_STRUM,
@@ -80,14 +95,25 @@ enum EditParam : uint8_t {
   EDIT_COUNT
 };
 
+enum EnvStage : uint8_t {
+  ENV_IDLE = 0,
+  ENV_ATTACK,
+  ENV_DECAY,
+  ENV_SUSTAIN,
+  ENV_RELEASE
+};
+
 struct Voice {
   volatile bool active = false;
   volatile bool gate = false;
   int midiNote = 60;
+  EnvStage envStage = ENV_IDLE;
   float phase = 0.0f;
   float phase2 = 0.0f;
+  float subPhase = 0.0f;
   float incr = 0.0f;
   float incr2 = 0.0f;
+  float subIncr = 0.0f;
   float env = 0.0f;
   float fEnv = 0.0f;
   float velocity = 1.0f;
@@ -97,12 +123,18 @@ struct Voice {
 struct SynthParams {
   Waveform wave = WAVE_SAW;
   float cutoff = 0.65f;       // Base cutoff (0..1)
-  float reso = 0.12f;         // Resonance (0..1)
+  float reso = 0.15f;         // Resonance (0..1)
   float filtEnv = 0.55f;      // Filter envelope modulation amount (0..1)
   float filtDecayMs = 280.0f; // Filter decay time (10..2000 ms)
-  float attackMs = 25.0f;
-  float releaseMs = 350.0f;
-  float detuneCents = 6.0f;
+  float attackMs = 20.0f;     // Amp Attack (1..2000 ms)
+  float decayMs = 120.0f;     // Amp Decay (10..2000 ms)
+  float sustain = 0.75f;      // Amp Sustain level (0..1)
+  float releaseMs = 350.0f;   // Amp Release (10..4000 ms)
+  float detuneCents = 6.0f;   // Dual-oscillator detune (0..40 cents)
+  float subOsc = 0.25f;       // Sub-oscillator volume (0..1)
+  LfoTarget lfoTarget = LFO_CUTOFF;
+  float lfoRateHz = 2.5f;     // LFO Speed (0.1..15.0 Hz)
+  float lfoDepth = 0.35f;     // LFO Intensity (0..1)
   float volume = 0.80f;       // Master volume (0..1)
 };
 
@@ -111,27 +143,30 @@ static SynthParams gParams;
 static portMUX_TYPE gAudioMux = portMUX_INITIALIZER_UNLOCKED;
 
 static int16_t gAudioBuf[kBufferCount][kBufferFrames];
+static int16_t gScopeBuf[kBufferFrames];
 static volatile int gWriteBuf = 0;
 static volatile bool gAudioRunning = false;
 static TaskHandle_t gAudioTask = nullptr;
 
 static M5Canvas gCanvas(&M5Cardputer.Display);
 
-static uint8_t gRootNote = 0;  // 0=C .. 11=B
+static uint8_t gRootNote = 0;    // 0=C .. 11=B
 static ScaleType gScale = SCALE_MAJOR;
 static ChordType gChordType = CHORD_TRIAD;
 static PlayMode gPlayMode = PLAY_NORMAL;
-static int gOctave = 3;        // MIDI octave for pad root
-static int gInversion = 1;     // 1st/2nd/3rd when Fn held
+static int gOctave = 3;          // MIDI octave for pad chords
+static int gPianoOctave = 4;     // MIDI octave for solo QWERTY keyboard
+static int gInversion = 1;       // 1st/2nd/3rd when Fn held
 static EditParam gEdit = EDIT_CUTOFF;
-static int gBpm = 120;         // Arpeggiator tempo (40..240 BPM)
-static int gStrumSpeedMs = 35; // Strum interval between notes (10..100 ms)
+static int gBpm = 120;           // Arpeggiator tempo (40..240 BPM)
+static int gStrumSpeedMs = 35;   // Strum interval between notes (10..100 ms)
 
-static char gLastChordName[24] = "-";
+static char gLastChordName[24] = "Ready";
 static char gLastNotes[32] = "";
 static bool gUiDirty = true;
 static bool gPadDown[kPadCount] = {};
 static int gActivePad = -1;
+static float gLiveFilterCutoffNorm = 0.65f;
 
 // Strummer and Arpeggiator state
 struct ScheduledNote {
@@ -149,6 +184,38 @@ static int gArpIndex = 0;
 static int gArpDir = 1;
 static uint32_t gLastTapTime = 0;
 
+// Piano key matrix tracking (QWERTY solo keys)
+struct SoloKeyDef {
+  char keyChar;
+  int semitoneOffset; // Relative to gPianoOctave * 12 + gRootNote
+};
+
+static const SoloKeyDef kSoloKeys[] = {
+  // White keys (Row 2)
+  {'a', 0},   // C
+  {'s', 2},   // D
+  {'d', 4},   // E
+  {'f', 5},   // F
+  {'g', 7},   // G
+  {'h', 9},   // A
+  {'j', 11},  // B
+  {'k', 12},  // C+1
+  {'l', 14},  // D+1
+  {';', 16},  // E+1
+  {'\'', 17}, // F+1
+  // Black keys (Row 1)
+  {'w', 1},   // C#
+  {'e', 3},   // D#
+  {'t', 6},   // F#
+  {'y', 8},   // G#
+  {'u', 10},  // A#
+  {'o', 13},  // C#+1
+  {'p', 15},  // D#+1
+  {'[', 18},  // F#+1
+};
+static constexpr size_t kSoloKeyCount = sizeof(kSoloKeys) / sizeof(kSoloKeys[0]);
+static bool gSoloKeyDown[kSoloKeyCount] = {};
+
 static const char* kNoteNames[] = {
   "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"
 };
@@ -159,14 +226,15 @@ static const char* kChordTypeNames[] = {
   "Triad", "+7", "+7+9", "Maj7", "Min7", "Dom7"
 };
 static const char* kWaveNames[] = { "Saw", "Square", "Tri" };
-static const char* kPlayModeNames[] = {
-  "Poly", "Strum Up", "Strum Dn", "Arp Up", "Arp Dn", "Arp UpDn", "Arp Rand"
-};
 static const char* kPlayModeBadges[] = {
   "POLY", "STRUM+", "STRUM-", "ARP+", "ARP-", "ARP+-", "ARP?"
 };
+static const char* kLfoTargetNames[] = {
+  "Off", "Cutoff", "Pitch", "Volume"
+};
 static const char* kEditNames[] = {
-  "Cutoff", "Reso", "F-Env", "F-Decay", "Attack", "Release", "Detune", "Wave", "BPM", "Strum", "Volume"
+  "Cutoff", "Reso", "F-Env", "F-Dec", "Attack", "Decay", "Sustain", "Release",
+  "LFO-Tgt", "LFO-Rate", "LFO-Dpth", "Detune", "Sub-Osc", "Wave", "BPM", "Strum", "Volume"
 };
 
 class BleServerCallbacks : public BLEServerCallbacks {
@@ -323,7 +391,6 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
   const bool locked = (gChordType == CHORD_MAJ7 || gChordType == CHORD_MIN7 || gChordType == CHORD_DOM7);
 
   if (!locked) {
-    // Scale-relative: degrees 1,3,5,(7),(9)
     push(degreeToMidi(degree));
     push(degreeToMidi(degree + 2));
     push(degreeToMidi(degree + 4));
@@ -331,7 +398,6 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
       push(degreeToMidi(degree + 6));
     }
     if (gChordType == CHORD_ADD79) {
-      // 1-3-7-9 voicing under 4-voice limit
       if (count == 5) {
         notes[2] = notes[3];
         notes[3] = notes[4];
@@ -365,16 +431,13 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
     notes[count - 1] = n + 12;
   }
 
-  // Cap to voice count
   if (count > kMaxChordNotes) count = kMaxChordNotes;
   *outCount = count;
   for (int i = 0; i < count; i++) outNotes[i] = notes[i];
 
-  // Name
   static const char* quality[] = {"", "7", "9", "maj7", "m7", "7"};
   const char* q = quality[gChordType];
   if (!locked) {
-    // Guess quality from 3rd in scale
     const int thirdInterval = (degreeToMidi(degree + 2) - rootMidi + 120) % 12;
     if (gChordType == CHORD_TRIAD) {
       q = (thirdInterval == 3) ? "m" : "";
@@ -389,7 +452,6 @@ static void buildChordNotes(int degree, bool invert, int* outNotes, int* outCoun
 }
 
 static int allocVoice() {
-  // Prefer free voice, else steal oldest
   int best = -1;
   uint32_t bestAge = 0;
   for (int i = 0; i < kMaxVoices; i++) {
@@ -414,19 +476,32 @@ static void noteOn(int midi, float velocity = 1.0f) {
   v.active = true;
   v.gate = true;
   v.midiNote = midi;
-  // Phase randomization prevents constructive wave stacking
+  v.envStage = ENV_ATTACK;
   v.phase = (float)(rand() % 1000) * 0.001f;
   v.phase2 = fmodf(v.phase + 0.37f, 1.0f);
+  v.subPhase = fmodf(v.phase + 0.5f, 1.0f);
   v.incr = hz / kSampleRate;
   v.incr2 = (hz * det) / kSampleRate;
+  v.subIncr = (hz * 0.5f) / kSampleRate; // 1 octave below
   v.env = 0.0f;
   v.fEnv = 1.0f; // Trigger filter envelope
   v.velocity = velocity;
   v.age = 0;
   portEXIT_CRITICAL(&gAudioMux);
 
-  // Broadcast wireless BLE MIDI note
   midiSendNoteOn((uint8_t)midi, (uint8_t)(velocity * 127.0f));
+}
+
+static void noteOff(int midi) {
+  portENTER_CRITICAL(&gAudioMux);
+  for (int i = 0; i < kMaxVoices; i++) {
+    if (gVoices[i].active && gVoices[i].midiNote == midi) {
+      gVoices[i].gate = false;
+      gVoices[i].envStage = ENV_RELEASE;
+      midiSendNoteOff((uint8_t)midi);
+    }
+  }
+  portEXIT_CRITICAL(&gAudioMux);
 }
 
 static void allNotesOff() {
@@ -436,6 +511,7 @@ static void allNotesOff() {
       midiSendNoteOff((uint8_t)gVoices[i].midiNote);
     }
     gVoices[i].gate = false;
+    gVoices[i].envStage = ENV_RELEASE;
   }
   portEXIT_CRITICAL(&gAudioMux);
 }
@@ -482,7 +558,7 @@ static void playChordPad(int padIndex, bool invert) {
       gStrumQueue[i].velocity = 1.0f - i * 0.03f;
     }
   } else {
-    // Arpeggiator mode: reset step counter and trigger immediately
+    // Arpeggiator mode
     gArpIndex = (gPlayMode == PLAY_ARP_DN) ? (count - 1) : 0;
     gArpDir = 1;
     gLastArpStep = millis();
@@ -520,7 +596,6 @@ static void updateArpeggiator() {
   if (now - gLastArpStep >= stepIntervalMs) {
     gLastArpStep = now;
 
-    // Advance note index
     if (gPlayMode == PLAY_ARP_UP) {
       gArpIndex = (gArpIndex + 1) % gCurrentChordCount;
     } else if (gPlayMode == PLAY_ARP_DN) {
@@ -554,34 +629,59 @@ static bool anyVoiceSounding() {
 
 static void renderBlock(int16_t* out, size_t frames) {
   const float attackInc = 1.0f / fmaxf(1.0f, gParams.attackMs * 0.001f * kSampleRate);
+  const float decayInc = 1.0f / fmaxf(1.0f, gParams.decayMs * 0.001f * kSampleRate);
   const float releaseInc = 1.0f / fmaxf(1.0f, gParams.releaseMs * 0.001f * kSampleRate);
   const float filtDecInc = 1.0f / fmaxf(1.0f, gParams.filtDecayMs * 0.001f * kSampleRate);
-  
+  const float lfoIncr = gParams.lfoRateHz / kSampleRate;
+
   static float lp = 0.0f;
   static float bp = 0.0f;
   static float hp_x = 0.0f;
   static float hp_y = 0.0f;
+  static float lfoPhase = 0.0f;
 
-  const float master = gParams.volume * 0.80f;
-  const Waveform wave = gParams.wave;
+  const float wave = gParams.wave;
   const float hp_r = 0.985f; // ~105 Hz highpass roll-off
 
   for (size_t n = 0; n < frames; n++) {
     float mix = 0.0f;
     float maxFenv = 0.0f;
 
+    // Advance LFO
+    lfoPhase += lfoIncr;
+    if (lfoPhase >= 1.0f) lfoPhase -= 1.0f;
+    float lfoVal = (lfoPhase < 0.5f) ? (4.0f * lfoPhase - 1.0f) : (3.0f - 4.0f * lfoPhase); // Triangle LFO (-1..+1)
+
+    float pitchMod = 1.0f;
+    if (gParams.lfoTarget == LFO_PITCH) {
+      pitchMod = powf(2.0f, (lfoVal * gParams.lfoDepth * 35.0f) / 1200.0f);
+    }
+
     for (int i = 0; i < kMaxVoices; i++) {
       Voice& v = gVoices[i];
       if (!v.active) continue;
 
+      // Full 4-Stage ADSR Engine
       if (v.gate) {
-        v.env += attackInc;
-        if (v.env > 1.0f) v.env = 1.0f;
+        if (v.envStage == ENV_ATTACK) {
+          v.env += attackInc;
+          if (v.env >= 1.0f) {
+            v.env = 1.0f;
+            v.envStage = ENV_DECAY;
+          }
+        } else if (v.envStage == ENV_DECAY) {
+          v.env -= decayInc;
+          if (v.env <= gParams.sustain) {
+            v.env = gParams.sustain;
+            v.envStage = ENV_SUSTAIN;
+          }
+        }
       } else {
         v.env -= releaseInc;
         if (v.env <= 0.0f) {
           v.env = 0.0f;
           v.active = false;
+          v.envStage = ENV_IDLE;
           continue;
         }
       }
@@ -591,19 +691,30 @@ static void renderBlock(int16_t* out, size_t frames) {
       if (v.fEnv < 0.0f) v.fEnv = 0.0f;
       if (v.fEnv > maxFenv) maxFenv = v.fEnv;
 
-      // Anti-aliased dual-oscillator voice
-      float s = oscSample(v.phase, v.incr, wave);
-      s += oscSample(v.phase2, v.incr2, wave) * 0.85f;
-      mix += s * 0.25f * v.env * v.velocity;
+      // Anti-aliased dual-oscillator voice + Sub-Oscillator
+      float s = oscSample(v.phase, v.incr * pitchMod, (Waveform)wave);
+      s += oscSample(v.phase2, v.incr2 * pitchMod, (Waveform)wave) * 0.85f;
+      // Warm Sub-Oscillator (Square wave 1 octave down)
+      s += (v.subPhase < 0.5f ? 1.0f : -1.0f) * gParams.subOsc * 0.6f;
 
-      v.phase += v.incr;
+      mix += s * 0.22f * v.env * v.velocity;
+
+      v.phase += v.incr * pitchMod;
       if (v.phase >= 1.0f) v.phase -= 1.0f;
-      v.phase2 += v.incr2;
+      v.phase2 += v.incr2 * pitchMod;
       if (v.phase2 >= 1.0f) v.phase2 -= 1.0f;
+      v.subPhase += v.subIncr * pitchMod;
+      if (v.subPhase >= 1.0f) v.subPhase -= 1.0f;
     }
 
-    // Dynamic Filter Envelope calculation
-    float dynCutoff = clampf(gParams.cutoff + maxFenv * gParams.filtEnv * 0.40f, 0.02f, 1.0f);
+    // Dynamic Filter Envelope & LFO Cutoff Modulation
+    float dynCutoff = gParams.cutoff + maxFenv * gParams.filtEnv * 0.40f;
+    if (gParams.lfoTarget == LFO_CUTOFF) {
+      dynCutoff += lfoVal * gParams.lfoDepth * 0.25f;
+    }
+    dynCutoff = clampf(dynCutoff, 0.02f, 1.0f);
+    gLiveFilterCutoffNorm = dynCutoff;
+
     float cutoffHz = 180.0f * powf(80.0f, dynCutoff);
     float f = clampf(2.0f * sinf(3.14159265f * cutoffHz / (kSampleRate * 2.0f)), 0.01f, 0.70f);
     float q = clampf(1.0f - gParams.reso * 0.85f, 0.15f, 1.0f);
@@ -619,14 +730,20 @@ static void renderBlock(int16_t* out, size_t frames) {
     hp_y = hp_in - hp_x + hp_r * hp_y;
     hp_x = hp_in;
 
+    // Master volume & Tremolo LFO
+    float master = gParams.volume * 0.80f;
+    if (gParams.lfoTarget == LFO_VOLUME) {
+      master *= clampf(1.0f + lfoVal * gParams.lfoDepth * 0.5f, 0.0f, 1.0f);
+    }
+
     // Warm analog saturation soft-clipper
     float sample = softClip(hp_y * master);
     out[n] = (int16_t)(sample * 28000.0f);
+    gScopeBuf[n] = out[n];
   }
 }
 
 static void audioTask(void*) {
-  // Feed I2S continuously via dedicated virtual channel 0.
   while (true) {
     const int idx = gWriteBuf;
     if (anyVoiceSounding()) {
@@ -635,6 +752,7 @@ static void audioTask(void*) {
     } else {
       gAudioRunning = false;
       memset(gAudioBuf[idx], 0, sizeof(gAudioBuf[idx]));
+      memset(gScopeBuf, 0, sizeof(gScopeBuf));
     }
 
     while (!M5Cardputer.Speaker.playRaw(
@@ -650,40 +768,43 @@ static void drawUi() {
   d.fillScreen(TFT_BLACK);
   d.setTextDatum(top_left);
 
-  // Header Title & Play Mode / BLE Badge
+  // --- Top Header ---
   d.setTextColor(TFT_ORANGE);
   d.setTextSize(1);
   d.drawString("CardSynth", 4, 2);
 
   d.setTextColor(gBleConnected ? TFT_GREEN : TFT_DARKGREY);
-  d.drawString(gBleConnected ? "BLE:ON" : "BLE:OFF", 74, 2);
+  d.drawString(gBleConnected ? "BLE:ON" : "BLE:OFF", 70, 2);
 
   d.setTextColor(gPlayMode == PLAY_NORMAL ? TFT_DARKGREY : TFT_CYAN);
   char modeBadge[20];
-  snprintf(modeBadge, sizeof(modeBadge), "[%s %dBPM]", kPlayModeBadges[gPlayMode], gBpm);
-  d.drawString(modeBadge, 130, 2);
+  snprintf(modeBadge, sizeof(modeBadge), "[%s %d]", kPlayModeBadges[gPlayMode], gBpm);
+  d.drawString(modeBadge, 126, 2);
 
-  // Large Chord Name
+  d.setTextColor(TFT_LIGHTGREY);
+  char pianoOctStr[12];
+  snprintf(pianoOctStr, sizeof(pianoOctStr), "P:C%d", gPianoOctave);
+  d.drawString(pianoOctStr, 204, 2);
+
+  // --- Left Side: Chord / Solo Note Info ---
   d.setTextColor(TFT_WHITE);
   d.setTextSize(2);
-  d.drawString(gLastChordName, 4, 16);
+  d.drawString(gLastChordName, 4, 15);
 
-  // Chord Notes
   d.setTextSize(1);
   d.setTextColor(TFT_LIGHTGREY);
-  d.drawString(gLastNotes, 4, 38);
+  d.drawString(gLastNotes, 4, 34);
 
-  // Scale & Transposition info
   char line[56];
-  snprintf(line, sizeof(line), "%s %s | %s | oct%d | inv%d",
-           getNoteName(gRootNote), kScaleNames[gScale], kChordTypeNames[gChordType], gOctave, gInversion);
+  snprintf(line, sizeof(line), "%s %s | oct%d | inv%d",
+           getNoteName(gRootNote), kScaleNames[gScale], gOctave, gInversion);
   d.setTextColor(TFT_CYAN);
-  d.drawString(line, 4, 52);
+  d.drawString(line, 4, 46);
 
-  // Active Edit Parameter & Value
+  // Edit Parameter line
   snprintf(line, sizeof(line), "Edit %s", kEditNames[gEdit]);
   d.setTextColor(TFT_YELLOW);
-  d.drawString(line, 4, 68);
+  d.drawString(line, 4, 59);
 
   switch (gEdit) {
     case EDIT_CUTOFF:
@@ -693,28 +814,46 @@ static void drawUi() {
       snprintf(line, sizeof(line), "%.0f%% [CC#71]", gParams.reso * 100.0f);
       break;
     case EDIT_FILT_ENV:
-      snprintf(line, sizeof(line), "%.0f%% (Mod Amt)", gParams.filtEnv * 100.0f);
+      snprintf(line, sizeof(line), "%.0f%% (VCF Mod)", gParams.filtEnv * 100.0f);
       break;
     case EDIT_FILT_DEC:
-      snprintf(line, sizeof(line), "%.0f ms (F-Decay)", gParams.filtDecayMs);
+      snprintf(line, sizeof(line), "%.0f ms (F-Dec)", gParams.filtDecayMs);
       break;
     case EDIT_ATTACK:
-      snprintf(line, sizeof(line), "%.0f ms", gParams.attackMs);
+      snprintf(line, sizeof(line), "%.0f ms (Atk)", gParams.attackMs);
+      break;
+    case EDIT_DECAY:
+      snprintf(line, sizeof(line), "%.0f ms (Dec)", gParams.decayMs);
+      break;
+    case EDIT_SUSTAIN:
+      snprintf(line, sizeof(line), "%.0f%% (Sus)", gParams.sustain * 100.0f);
       break;
     case EDIT_RELEASE:
-      snprintf(line, sizeof(line), "%.0f ms", gParams.releaseMs);
+      snprintf(line, sizeof(line), "%.0f ms (Rel)", gParams.releaseMs);
+      break;
+    case EDIT_LFO_TARGET:
+      snprintf(line, sizeof(line), "%s", kLfoTargetNames[gParams.lfoTarget]);
+      break;
+    case EDIT_LFO_RATE:
+      snprintf(line, sizeof(line), "%.1f Hz", gParams.lfoRateHz);
+      break;
+    case EDIT_LFO_DEPTH:
+      snprintf(line, sizeof(line), "%.0f%%", gParams.lfoDepth * 100.0f);
       break;
     case EDIT_DETUNE:
       snprintf(line, sizeof(line), "%.1f ct", gParams.detuneCents);
+      break;
+    case EDIT_SUB:
+      snprintf(line, sizeof(line), "%.0f%% (Sub-Osc)", gParams.subOsc * 100.0f);
       break;
     case EDIT_WAVE:
       snprintf(line, sizeof(line), "%s", kWaveNames[gParams.wave]);
       break;
     case EDIT_BPM:
-      snprintf(line, sizeof(line), "%d BPM [Space: Tap]", gBpm);
+      snprintf(line, sizeof(line), "%d BPM", gBpm);
       break;
     case EDIT_STRUM:
-      snprintf(line, sizeof(line), "%d ms (Strum Speed)", gStrumSpeedMs);
+      snprintf(line, sizeof(line), "%d ms", gStrumSpeedMs);
       break;
     case EDIT_VOLUME:
       snprintf(line, sizeof(line), "%.0f%% [CC#7]", gParams.volume * 100.0f);
@@ -724,12 +863,88 @@ static void drawUi() {
       break;
   }
   d.setTextColor(TFT_WHITE);
-  d.drawString(line, 4, 82);
+  d.drawString(line, 4, 71);
 
-  // Quick Help Footer
+  // --- Right Side: Real-Time Live Oscilloscope ---
+  const int scopeX = 144;
+  const int scopeY = 15;
+  const int scopeW = 92;
+  const int scopeH = 46;
+  d.drawRect(scopeX, scopeY, scopeW, scopeH, 0x2124); // Dark border
+  d.fillRect(scopeX + 1, scopeY + 1, scopeW - 2, scopeH - 2, 0x0821); // Dark navy background
+  d.drawFastHLine(scopeX + 1, scopeY + scopeH / 2, scopeW - 2, 0x18C3); // Center grid line
+
+  // Plot live waveform trace
+  int lastPy = scopeY + scopeH / 2;
+  for (int x = 0; x < scopeW - 2; x++) {
+    int sIdx = (x * kBufferFrames) / (scopeW - 2);
+    int sample = gScopeBuf[sIdx];
+    int py = (scopeY + scopeH / 2) - (sample * (scopeH / 2 - 2)) / 30000;
+    py = (int)clampf((float)py, (float)(scopeY + 2), (float)(scopeY + scopeH - 3));
+    if (x > 0) {
+      d.drawLine(scopeX + x, lastPy, scopeX + 1 + x, py, TFT_GREEN);
+    }
+    lastPy = py;
+  }
+
+  // --- Right Side Lower: Animated Filter Curve Visualizer ---
+  const int fltX = 144;
+  const int fltY = 64;
+  const int fltW = 92;
+  const int fltH = 22;
+  d.drawRect(fltX, fltY, fltW, fltH, 0x2124);
+  d.fillRect(fltX + 1, fltY + 1, fltW - 2, fltH - 2, 0x0800);
+
+  // Draw filter curve
+  int cutPx = (int)(gLiveFilterCutoffNorm * (fltW - 6));
+  for (int x = 0; x < fltW - 2; x++) {
+    float normX = (float)x / (fltW - 2);
+    float gain = 1.0f;
+    if (normX > gLiveFilterCutoffNorm) {
+      float delta = normX - gLiveFilterCutoffNorm;
+      gain = expf(-delta * (5.0f + gParams.reso * 8.0f));
+    } else if (fabsf(normX - gLiveFilterCutoffNorm) < 0.1f) {
+      gain += gParams.reso * 0.8f * (1.0f - fabsf(normX - gLiveFilterCutoffNorm) / 0.1f);
+    }
+    int cy = (fltY + fltH - 2) - (int)(gain * (fltH - 4));
+    cy = (int)clampf((float)cy, (float)(fltY + 2), (float)(fltY + fltH - 2));
+    d.drawPixel(fltX + 1 + x, cy, TFT_CYAN);
+  }
+  // Cutoff dot indicator
+  d.fillCircle(fltX + 3 + cutPx, fltY + 8, 2, TFT_YELLOW);
+
+  // --- Bottom: 8-Pad Graphical Grid Visualizer ---
+  const int padY = 89;
+  const int padH = 30;
+  const int padW = 27;
+  for (int i = 0; i < kPadCount; i++) {
+    int px = 4 + i * 29;
+    bool isDown = gPadDown[i];
+    bool isArpStep = (gPlayMode >= PLAY_ARP_UP && gActivePad == i);
+
+    uint16_t padBorder = isDown ? TFT_ORANGE : (isArpStep ? TFT_CYAN : 0x4208);
+    uint16_t padBg = isDown ? TFT_ORANGE : 0x10A2;
+    d.fillRect(px, padY, padW, padH, padBg);
+    d.drawRect(px, padY, padW, padH, padBorder);
+
+    // Number & chord label
+    char pNum[4];
+    snprintf(pNum, sizeof(pNum), "%d", i + 1);
+    d.setTextColor(isDown ? TFT_BLACK : TFT_DARKGREY);
+    d.drawString(pNum, px + 2, padY + 2);
+
+    int chordNotes[kMaxChordNotes];
+    int cCount = 0;
+    char cName[16];
+    buildChordNotes(i, false, chordNotes, &cCount, cName, sizeof(cName));
+    cName[4] = 0; // Shorten
+    d.setTextColor(isDown ? TFT_BLACK : TFT_WHITE);
+    d.drawString(cName, px + 2, padY + 16);
+  }
+
+  // --- Footer Help ---
   d.setTextColor(TFT_DARKGREY);
-  d.drawString("1-8 chord  a:mode  spc:tap  ,/. edit", 4, 104);
-  d.drawString("; type  ' scale  [] key  i inv", 4, 118);
+  d.drawString("1-8:chord  QWERTY:solo  spc:tap  tab:key  ent:mode", 4, 124);
 
   gCanvas.pushSprite(0, 0);
 }
@@ -751,13 +966,31 @@ static void nudgeEdit(int dir) {
       gParams.filtDecayMs = clampf(gParams.filtDecayMs + dir * 20.0f, 10.0f, 2000.0f);
       break;
     case EDIT_ATTACK:
-      gParams.attackMs = clampf(gParams.attackMs + dir * 6.0f, 1.0f, 2000.0f);
+      gParams.attackMs = clampf(gParams.attackMs + dir * 5.0f, 1.0f, 2000.0f);
+      break;
+    case EDIT_DECAY:
+      gParams.decayMs = clampf(gParams.decayMs + dir * 10.0f, 10.0f, 2000.0f);
+      break;
+    case EDIT_SUSTAIN:
+      gParams.sustain = clampf(gParams.sustain + dir * 0.05f, 0.0f, 1.0f);
       break;
     case EDIT_RELEASE:
       gParams.releaseMs = clampf(gParams.releaseMs + dir * 20.0f, 10.0f, 4000.0f);
       break;
+    case EDIT_LFO_TARGET:
+      gParams.lfoTarget = (LfoTarget)((gParams.lfoTarget + dir + LFO_TARGET_COUNT) % LFO_TARGET_COUNT);
+      break;
+    case EDIT_LFO_RATE:
+      gParams.lfoRateHz = clampf(gParams.lfoRateHz + dir * 0.2f, 0.1f, 15.0f);
+      break;
+    case EDIT_LFO_DEPTH:
+      gParams.lfoDepth = clampf(gParams.lfoDepth + dir * 0.05f, 0.0f, 1.0f);
+      break;
     case EDIT_DETUNE:
       gParams.detuneCents = clampf(gParams.detuneCents + dir * 1.0f, 0.0f, 40.0f);
+      break;
+    case EDIT_SUB:
+      gParams.subOsc = clampf(gParams.subOsc + dir * 0.05f, 0.0f, 1.0f);
       break;
     case EDIT_WAVE:
       gParams.wave = (Waveform)((gParams.wave + dir + WAVE_COUNT) % WAVE_COUNT);
@@ -786,32 +1019,77 @@ static void handleKeyboard() {
   auto st = M5Cardputer.Keyboard.keysState();
   const bool fn = st.fn;
 
-  // Track pad presses via matrix so Fn+digit still maps to the physical key.
-  bool nowDown[kPadCount] = {};
+  // --- 1. Top Row Pad Matrix Scan (Keys 1-8) ---
+  bool nowPadDown[kPadCount] = {};
   for (const auto& p : M5Cardputer.Keyboard.keyList()) {
     if (p.y == 0 && p.x >= 1 && p.x <= 8) {
-      nowDown[p.x - 1] = true;
+      nowPadDown[p.x - 1] = true;
     }
   }
 
   for (int i = 0; i < kPadCount; i++) {
-    if (nowDown[i] && !gPadDown[i]) {
+    if (nowPadDown[i] && !gPadDown[i]) {
       playChordPad(i, fn);
     }
-    if (!nowDown[i] && gPadDown[i]) {
-      // Release pad
+    if (!nowPadDown[i] && gPadDown[i]) {
       bool any = false;
       for (int j = 0; j < kPadCount; j++) {
-        if (j != i && nowDown[j]) any = true;
+        if (j != i && nowPadDown[j]) any = true;
       }
-      if (!any) {
+      if (!any && gActivePad == i) {
         allNotesOff();
         clearStrumQueue();
         gActivePad = -1;
         gUiDirty = true;
       }
     }
-    gPadDown[i] = nowDown[i];
+    gPadDown[i] = nowPadDown[i];
+  }
+
+  // --- 2. QWERTY Solo Piano Keyboard Matrix Scan (Rows 1 & 2) ---
+  bool nowSoloDown[kSoloKeyCount] = {};
+  for (const auto& p : M5Cardputer.Keyboard.keyList()) {
+    for (size_t k = 0; k < kSoloKeyCount; k++) {
+      char targetChar = kSoloKeys[k].keyChar;
+      // Match physical matrix coordinates
+      if (p.y == 1) { // Row 1: q,w,e,r,t,y,u,i,o,p,[,]
+        if (targetChar == 'w' && p.x == 2) nowSoloDown[k] = true;
+        if (targetChar == 'e' && p.x == 3) nowSoloDown[k] = true;
+        if (targetChar == 't' && p.x == 5) nowSoloDown[k] = true;
+        if (targetChar == 'y' && p.x == 6) nowSoloDown[k] = true;
+        if (targetChar == 'u' && p.x == 7) nowSoloDown[k] = true;
+        if (targetChar == 'o' && p.x == 9) nowSoloDown[k] = true;
+        if (targetChar == 'p' && p.x == 10) nowSoloDown[k] = true;
+        if (targetChar == '[' && p.x == 11) nowSoloDown[k] = true;
+      } else if (p.y == 2) { // Row 2: a,s,d,f,g,h,j,k,l,;,'
+        if (targetChar == 'a' && p.x == 2) nowSoloDown[k] = true;
+        if (targetChar == 's' && p.x == 3) nowSoloDown[k] = true;
+        if (targetChar == 'd' && p.x == 4) nowSoloDown[k] = true;
+        if (targetChar == 'f' && p.x == 5) nowSoloDown[k] = true;
+        if (targetChar == 'g' && p.x == 6) nowSoloDown[k] = true;
+        if (targetChar == 'h' && p.x == 7) nowSoloDown[k] = true;
+        if (targetChar == 'j' && p.x == 8) nowSoloDown[k] = true;
+        if (targetChar == 'k' && p.x == 9) nowSoloDown[k] = true;
+        if (targetChar == 'l' && p.x == 10) nowSoloDown[k] = true;
+        if (targetChar == ';' && p.x == 11) nowSoloDown[k] = true;
+        if (targetChar == '\'' && p.x == 12) nowSoloDown[k] = true;
+      }
+    }
+  }
+
+  for (size_t k = 0; k < kSoloKeyCount; k++) {
+    int soloMidi = 12 * (gPianoOctave + 1) + gRootNote + kSoloKeys[k].semitoneOffset;
+    if (nowSoloDown[k] && !gSoloKeyDown[k]) {
+      noteOn(soloMidi, 1.0f);
+      snprintf(gLastChordName, sizeof(gLastChordName), "Solo %s%d", getNoteName(soloMidi), gPianoOctave + (kSoloKeys[k].semitoneOffset / 12));
+      snprintf(gLastNotes, sizeof(gLastNotes), "%s", getNoteName(soloMidi));
+      gUiDirty = true;
+    }
+    if (!nowSoloDown[k] && gSoloKeyDown[k]) {
+      noteOff(soloMidi);
+      gUiDirty = true;
+    }
+    gSoloKeyDown[k] = nowSoloDown[k];
   }
 
   if (!M5Cardputer.Keyboard.isPressed()) return;
@@ -831,7 +1109,13 @@ static void handleKeyboard() {
     gLastTapTime = now;
   }
 
-  // One-shot controls from character layer
+  // Enter toggles Play Mode (Poly / Strum / Arp)
+  if (st.enter) {
+    gPlayMode = (PlayMode)((gPlayMode + 1) % PLAY_MODE_COUNT);
+    gUiDirty = true;
+  }
+
+  // Character Layer controls
   for (auto c : st.word) {
     switch (c) {
       case ',':
@@ -842,29 +1126,46 @@ static void handleKeyboard() {
       case '>':
         nudgeEdit(1);
         break;
-      case 'a':
-      case 'A':
-        gPlayMode = (PlayMode)((gPlayMode + 1) % PLAY_MODE_COUNT);
+      case '/':
+      case '?':
+        gEdit = (EditParam)((gEdit + 1) % EDIT_COUNT);
         gUiDirty = true;
         break;
-      case ';':
-      case ':':
-        gChordType = (ChordType)((gChordType + 1) % CHORD_TYPE_COUNT);
+      case 'z':
+      case 'Z':
+        if (gPianoOctave > 1) {
+          gPianoOctave--;
+          gUiDirty = true;
+        }
+        break;
+      case 'x':
+      case 'X':
+        if (gPianoOctave < 6) {
+          gPianoOctave++;
+          gUiDirty = true;
+        }
+        break;
+      case 'c':
+      case 'C':
+        gEdit = (EditParam)((gEdit + 1) % EDIT_COUNT);
         gUiDirty = true;
         break;
-      case '\'':
-      case '"':
-        gScale = (ScaleType)((gScale + 1) % SCALE_COUNT);
+      case 'v':
+      case 'V':
+        nudgeEdit(-1);
+        break;
+      case 'b':
+      case 'B':
+        nudgeEdit(1);
+        break;
+      case 'n':
+      case 'N':
+        gParams.wave = (Waveform)((gParams.wave + 1) % WAVE_COUNT);
         gUiDirty = true;
         break;
-      case '[':
-      case '{':
-        gRootNote = (gRootNote + 11) % 12;
-        gUiDirty = true;
-        break;
-      case ']':
-      case '}':
-        gRootNote = (gRootNote + 1) % 12;
+      case 'm':
+      case 'M':
+        gParams.lfoTarget = (LfoTarget)((gParams.lfoTarget + 1) % LFO_TARGET_COUNT);
         gUiDirty = true;
         break;
       case '-':
@@ -884,66 +1185,6 @@ static void handleKeyboard() {
       case 'i':
       case 'I':
         gInversion = (gInversion % 3) + 1;
-        gUiDirty = true;
-        break;
-      case '/':
-      case '?':
-        gEdit = (EditParam)((gEdit + 1) % EDIT_COUNT);
-        gUiDirty = true;
-        break;
-      case 'z':
-      case 'Z':
-        gEdit = EDIT_CUTOFF;
-        gUiDirty = true;
-        break;
-      case 'x':
-      case 'X':
-        gEdit = EDIT_RESO;
-        gUiDirty = true;
-        break;
-      case 'f':
-      case 'F':
-        gEdit = EDIT_FILT_ENV;
-        gUiDirty = true;
-        break;
-      case 'd':
-      case 'D':
-        gEdit = EDIT_FILT_DEC;
-        gUiDirty = true;
-        break;
-      case 'c':
-      case 'C':
-        gEdit = EDIT_ATTACK;
-        gUiDirty = true;
-        break;
-      case 'v':
-      case 'V':
-        gEdit = EDIT_RELEASE;
-        gUiDirty = true;
-        break;
-      case 'b':
-      case 'B':
-        gEdit = EDIT_DETUNE;
-        gUiDirty = true;
-        break;
-      case 'n':
-      case 'N':
-        gEdit = EDIT_WAVE;
-        gUiDirty = true;
-        break;
-      case 't':
-      case 'T':
-        gEdit = EDIT_BPM;
-        gUiDirty = true;
-        break;
-      case 's':
-      case 'S':
-        gEdit = EDIT_STRUM;
-        gUiDirty = true;
-        break;
-      case 'm':
-      case 'M':
-        gEdit = EDIT_VOLUME;
         gUiDirty = true;
         break;
       default:
@@ -1009,7 +1250,7 @@ void setup() {
   } else {
     snprintf(gLastChordName, sizeof(gLastChordName), "Board %d", (int)board);
   }
-  strncpy(gLastNotes, "press 1-8", sizeof(gLastNotes) - 1);
+  strncpy(gLastNotes, "Play 1-8 or QWERTY", sizeof(gLastNotes) - 1);
   drawUi();
 
   // Speaker task is priority 5; keep synth feed slightly below it on core 1.
@@ -1017,13 +1258,18 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t lastScopeRedraw = 0;
   M5Cardputer.update();
   handleKeyboard();
   updateStrumQueue();
   updateArpeggiator();
-  if (gUiDirty) {
+
+  uint32_t now = millis();
+  // Redraw UI when dirty or 30 FPS oscilloscope refresh when audio is sounding
+  if (gUiDirty || (gAudioRunning && (now - lastScopeRedraw >= 33))) {
     drawUi();
     gUiDirty = false;
+    lastScopeRedraw = now;
   }
   delay(2);
 }
