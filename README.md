@@ -2,8 +2,6 @@
 
 A 4-voice polyphonic synthesizer, chord machine, and wireless Bluetooth BLE-MIDI controller built for the **M5Stack Cardputer** (ESP32-S3).
 
-![CardSynth UI](https://raw.githubusercontent.com/CircuitGhost/cardsynth/main/docs/preview.png) *(or add screenshot)*
-
 ---
 
 ## Features
@@ -45,9 +43,9 @@ A 4-voice polyphonic synthesizer, chord machine, and wireless Bluetooth BLE-MIDI
 | **`Fn` + `1` – `8`** | Trigger Inverted Chords |
 | **`A` – `'`** | Play Solo White Keys (C through F5) |
 | **`W` – `[`** | Play Solo Black Keys (C# through F#5) |
-| **`Enter`** | Cycle Play Mode (`Poly` $\to$ `Strum ↑` $\to$ `Strum ↓` $\to$ `Arp ↑` $\to$ `Arp ↓` $\to$ `Arp ↑↓` $\to$ `Arp ?`) |
+| **`Enter`** | Cycle Play Mode (`Poly` → `Strum ↑` → `Strum ↓` → `Arp ↑` → `Arp ↓` → `Arp ↑↓` → `Arp ?`) |
 | **`Space`** | Tap-Tempo (automatically detects & sets BPM) |
-| **`Tab`** | Transpose Root Key ($C \to C\# \to D \dots$) |
+| **`Tab`** | Transpose Root Key (C → C# → D → ...) |
 | **`i` / `I`** | Cycle Inversion Step (1st, 2nd, 3rd) |
 | **`z` / `x`** | Shift Solo Piano Octave Down / Up |
 
@@ -57,8 +55,8 @@ A 4-voice polyphonic synthesizer, chord machine, and wireless Bluetooth BLE-MIDI
 |---|---|
 | **`c` / `C`** | Cycle Active Edit Parameter |
 | **`v` / `b`** or **`,` / `.`** | Decrement / Increment Selected Parameter Value |
-| **`n` / `N`** | Cycle Oscillator Waveform (`Saw` $\to$ `Square` $\to$ `Tri`) |
-| **`m` / `M`** | Cycle LFO Target (`Off` $\to$ `Cutoff` $\to$ `Pitch` $\to$ `Volume`) |
+| **`n` / `N`** | Cycle Oscillator Waveform (`Saw` → `Square` → `Tri`) |
+| **`m` / `M`** | Cycle LFO Target (`Off` → `Cutoff` → `Pitch` → `Volume`) |
 | **`;` / `'`** | Cycle Chord Types (`Triad`, `+7`, `+7+9`, `Maj7`, `Min7`, `Dom7`) & Scales |
 | **`-` / `=`** | Shift Chord Pad Octave Down / Up |
 
@@ -92,8 +90,8 @@ A 4-voice polyphonic synthesizer, chord machine, and wireless Bluetooth BLE-MIDI
 
 CardSynth advertises automatically as **`CardSynth MIDI`**.
 
-- **Mac**: Open **Audio MIDI Setup** $\to$ **Window** $\to$ **MIDI Studio** $\to$ click the **Bluetooth** icon $\to$ click **Connect** next to `CardSynth MIDI`.
-- **iOS / iPadOS**: Open GarageBand, AUM, or Koala $\to$ **Settings** $\to$ **Bluetooth MIDI Devices** $\to$ connect to `CardSynth MIDI`.
+- **Mac**: Open **Audio MIDI Setup** → **Window** → **MIDI Studio** → click the **Bluetooth** icon → click **Connect** next to `CardSynth MIDI`.
+- **iOS / iPadOS**: Open GarageBand, AUM, or Koala → **Settings** → **Bluetooth MIDI Devices** → connect to `CardSynth MIDI`.
 - **Windows**: Pair in Bluetooth Settings, then route via **MIDIberry** or your DAW's Bluetooth MIDI settings.
 
 ---
